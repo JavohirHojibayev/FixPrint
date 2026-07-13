@@ -1116,31 +1116,41 @@ class App(tk.Tk):
 
 
     def configure_trusted_print_servers(self) -> None:
-        self.log_section("Point and Print cheklovlarini olib tashlash")
-        # Eslatma: bu yerda avval "faqat topilgan serverlarga ruxsat" (whitelist)
-        # rejimi yoqilardi (Restricted=1, TrustedServers=1). Amalda bu, keyinchalik
-        # boshqa/whitelistda yo'q print-serverga ulanishga urinilganda:
-        #   "Установленная на данном компьютере политика не позволяет
-        #    подключение к данной очереди печати" xatosini keltirib chiqargan.
-        # Shuning uchun bu yerda cheklov butunlay o'chiriladi - istalgan
-        # print-serverga ulanishga ruxsat beriladi.
+        self.log_section("Point and Print cheklovlarini sozlash")
+        servers = self.get_candidate_servers()
+        if servers:
+            server_list = ";".join(servers)
+            self.log_line(f"Ruxsat etilgan serverlar: {server_list}", "info")
+            restricted = "1"
+        else:
+            server_list = ""
+            restricted = "0"
+
         commands = [
-            r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v Restricted /t REG_DWORD /d 0 /f',
-            r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v TrustedServers /t REG_DWORD /d 0 /f',
-            r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v InForest /t REG_DWORD /d 0 /f',
-            r'reg delete "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v ServerList /f',
+            r'reg delete "HKCU\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /f',
+            r'reg delete "HKCU\Software\Policies\Microsoft\Windows NT\Printers\PackagePointAndPrint" /f',
+            rf'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v Restricted /t REG_DWORD /d {restricted} /f',
+            rf'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v TrustedServers /t REG_DWORD /d {restricted} /f',
+            r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v InForest /t REG_DWORD /d 1 /f',
             r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PackagePointAndPrint" /v PackagePointAndPrintOnly /t REG_DWORD /d 0 /f',
-            r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PackagePointAndPrint" /v PackagePointAndPrintServerList /t REG_DWORD /d 0 /f',
-            r'reg delete "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PackagePointAndPrint\ListofServers" /f',
+            rf'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PackagePointAndPrint" /v PackagePointAndPrintServerList /t REG_DWORD /d {restricted} /f',
         ]
+        
+        if server_list:
+            commands.append(rf'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v ServerList /t REG_SZ /d "{server_list}" /f')
+            commands.append(rf'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PackagePointAndPrint\ListofServers" /v "{server_list}" /t REG_SZ /d "{server_list}" /f')
+        else:
+            commands.append(r'reg delete "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v ServerList /f')
+            commands.append(r'reg delete "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PackagePointAndPrint\ListofServers" /f')
+
         for command in commands:
             code, out, err = run(command, 20)
             label = command.split(" /v ")[-1].split(" ")[0] if " /v " in command else command.split("\\")[-1].split(" ")[0]
             if code == 0:
                 self.log_line(f"OK: {label}", "ok")
             else:
-                self.log_line(f"O'tkazib yuborildi (avval mavjud emas edi): {label}", "dim")
-        self.log_line("Point and Print / Package Point and Print cheklovlari o'chirildi.", "ok")
+                self.log_line(f"O'tkazib yuborildi: {label}", "dim")
+        self.log_line("Point and Print cheklovlari yangilandi.", "ok")
 
     def repair_server_alias_settings(self) -> None:
         self.log_section("Server alias va print host sozlamalari")
