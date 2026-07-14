@@ -761,7 +761,7 @@ class App(tk.Tk):
         if (Get-Command Set-Service -ErrorAction SilentlyContinue) {{
             Set-Service -Name Spooler -StartupType Automatic
         }}
-        Write-Output 'LOG: Spooler to'xtatilmoqda'
+        Write-Output "LOG: Spooler to'xtatilmoqda"
         Stop-Service -Name Spooler -Force
         Get-Process spoolsv -ErrorAction SilentlyContinue | Stop-Process -Force
         Start-Sleep -Seconds 1
@@ -938,7 +938,7 @@ class App(tk.Tk):
                     Get-ChildItem -Path $path -ErrorAction SilentlyContinue | ForEach-Object {
                         if ($_.PSChildName -match '^,,([^,]+),([^,]+)$') {
                             Write-Output ("HOST:" + $matches[1])
-                            Write-Output ("SHARE:\\\\{0}\\{1}" -f $matches[1], $matches[2])
+                            Write-Output ("SHARE:\\{0}\{1}" -f $matches[1], $matches[2])
                         }
                         Write-Output ("LOG: User connection o'chirildi: " + $_.PSChildName)
                         Remove-Item -LiteralPath $_.PSPath -Recurse -Force -ErrorAction SilentlyContinue
@@ -1437,7 +1437,7 @@ class App(tk.Tk):
         for message in messages:
             self.log_line(message, "dim")
         if values.get("LegacyMode", "0") == "1":
-            self.log_line("Windows default printer auto-boshqaruvi yoqildi", "ok")
+            self.log_line("Standart printer qo'lda boshqariladigan (legacy) rejimga o'tkazildi - Windows uni avtomatik almashtirmaydi", "ok")
         removed = values.get("StaleDeviceRemoved", "0")
         if removed != "0":
             self.log_line(f"Eski default registry yozuvi tozalandi: {removed}", "ok")
@@ -1641,13 +1641,13 @@ class App(tk.Tk):
                         $enabled = $true
                     }}
                 }} else {{
-                    $printer = Get-WmiObject Win32_Printer -Filter ("Name='{0}'" -f $printerName.Replace("'", "''")) -ErrorAction SilentlyContinue
+                    $printer = Get-WmiObject Win32_Printer -Filter ("Name='{{0}}'" -f $printerName.Replace("'", "''")) -ErrorAction SilentlyContinue
                     if ($printer) {{
                         $printer.Shared = $true
                         $printer.ShareName = $shareName
                         $printer.Put() | Out-Null
                         Start-Sleep -Seconds 1
-                        $check = Get-WmiObject Win32_Printer -Filter ("Name='{0}'" -f $printerName.Replace("'", "''")) -ErrorAction SilentlyContinue
+                        $check = Get-WmiObject Win32_Printer -Filter ("Name='{{0}}'" -f $printerName.Replace("'", "''")) -ErrorAction SilentlyContinue
                         if ($check -and $check.Shared -and $check.ShareName -eq $shareName) {{
                             $enabled = $true
                         }}
@@ -1779,6 +1779,10 @@ class App(tk.Tk):
         self.repair_print_core()
         self.set_progress("Tekshirilmoqda", "Registry sozlamalari yozilmoqda", BLUE)
         self.registry_fix()
+        self.set_progress("Kuting", "Spooler va queue tozalanmoqda", YELLOW)
+        spooler_ready = self.spooler_fix()
+        if not spooler_ready:
+            self.log_line("Spooler to'liq tiklanmadi, ammo qolgan repair davom etadi.", "warn")
         self.set_progress("Tekshirilmoqda", "Ghost connectionlar tozalanmoqda", BLUE)
         self.clear_ghost_connections()
         self.set_progress("Tekshirilmoqda", "Print server DNS tekshirilmoqda", BLUE)
@@ -1791,10 +1795,6 @@ class App(tk.Tk):
         self.repair_server_alias_settings()
         self.set_progress("Tekshirilmoqda", "Remote drayverlar tayyorlanmoqda", BLUE)
         self.stage_remote_print_drivers()
-        self.set_progress("Kuting", "Spooler va queue tozalanmoqda", YELLOW)
-        spooler_ready = self.spooler_fix()
-        if not spooler_ready:
-            self.log_line("Spooler to'liq tiklanmadi, ammo qolgan repair davom etadi.", "warn")
         self.set_progress("Tekshirilmoqda", "Printer joblari o'chirilmoqda", BLUE)
         self.clear_stuck_jobs()
         self.set_progress("Tekshirilmoqda", "Offline/pauza holatlar tuzatilmoqda", BLUE)
