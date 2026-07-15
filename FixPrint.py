@@ -1113,6 +1113,217 @@ class App(tk.Tk):
                 self.log_line(line[5:].strip(), "warn")
 
 
+    def point_and_print_policy_fix(self) -> None:
+        """Point and Print Restrictions siyosatini tuzatish.
+        
+        Xato: 'Установленная на данном компьютере политика не позволяет
+        подключение к данной очереди печати.'
+        
+        Bu metod registry sozlamalarini yozadi va Print Spooler'ni qayta
+        ishga tushiradi.
+        """
+        self.log_section("Point and Print Restrictions siyosatini tuzatish")
+        script = r"""
+        $ErrorActionPreference = 'Stop'
+        $summary = @{
+            RegistryKeysSet = 0
+            PackageKeysSet = 0
+            SpoolerRestarted = 0
+            Errors = 0
+        }
+
+        # PointAndPrint registry sozlamalari
+        $regPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers\PointAndPrint'
+        try {
+            if (-not (Test-Path $regPath)) {
+                New-Item -Path $regPath -Force | Out-Null
+                Write-Output ("LOG: Registry kaliti yaratildi: " + $regPath)
+            }
+
+            $settings = [ordered]@{
+                'RestrictDriverInstallationToAdministrators' = 0
+                'TrustedServers'                             = 0
+                'InForest'                                   = 0
+                'NoWarningNoElevationOnInstall'               = 1
+                'UpdatePromptSettings'                        = 0
+                'Restricted'                                  = 0
+            }
+
+            foreach ($name in $settings.Keys) {
+                New-ItemProperty -Path $regPath -Name $name -PropertyType DWord -Value $settings[$name] -Force | Out-Null
+                Write-Output ("LOG: " + $name + " = " + $settings[$name])
+                $summary.RegistryKeysSet++
+            }
+        } catch {
+            Write-Output ("LOG: PointAndPrint registry xatosi: " + $_.Exception.Message)
+            $summary.Errors++
+        }
+
+        # PackagePointAndPrint registry sozlamalari
+        $pkgRegPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers\PackagePointAndPrint'
+        try {
+            if (-not (Test-Path $pkgRegPath)) {
+                New-Item -Path $pkgRegPath -Force | Out-Null
+                Write-Output ("LOG: Registry kaliti yaratildi: " + $pkgRegPath)
+            }
+            New-ItemProperty -Path $pkgRegPath -Name 'PackagePointAndPrintOnly' -PropertyType DWord -Value 0 -Force | Out-Null
+            New-ItemProperty -Path $pkgRegPath -Name 'PackagePointAndPrintServerList' -PropertyType DWord -Value 0 -Force | Out-Null
+            Write-Output 'LOG: PackagePointAndPrint qiymatlari yozildi'
+            $summary.PackageKeysSet = 2
+        } catch {
+            Write-Output ("LOG: PackagePointAndPrint registry xatosi: " + $_.Exception.Message)
+            $summary.Errors++
+        }
+
+        # Print Spooler qayta ishga tushirish
+        try {
+            Write-Output 'LOG: Print Spooler qayta ishga tushirilmoqda'
+            Restart-Service -Name Spooler -Force -ErrorAction Stop
+            Start-Sleep -Seconds 2
+            $svc = Get-Service -Name Spooler -ErrorAction SilentlyContinue
+            if ($svc -and $svc.Status -eq 'Running') {
+                Write-Output 'LOG: Print Spooler muvaffaqiyatli qayta ishga tushdi'
+                $summary.SpoolerRestarted = 1
+            } else {
+                Write-Output 'LOG: Print Spooler qayta ishga tushmadi'
+                $summary.Errors++
+            }
+        } catch {
+            Write-Output ("LOG: Spooler qayta ishga tushirishda xato: " + $_.Exception.Message)
+            $summary.Errors++
+        }
+
+        $summary.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }
+        """
+        code, out, _ = ps(script, 60)
+        values, messages = parse_script_output(out)
+        for message in messages:
+            self.log_line(message, "dim")
+        reg_keys = values.get("RegistryKeysSet", "0")
+        pkg_keys = values.get("PackageKeysSet", "0")
+        self.log_line(f"PointAndPrint registry qiymatlari yozildi: {reg_keys}", "ok")
+        if pkg_keys != "0":
+            self.log_line(f"PackagePointAndPrint registry qiymatlari yozildi: {pkg_keys}", "ok")
+        if values.get("SpoolerRestarted", "0") == "1":
+            self.log_line("Print Spooler muvaffaqiyatli qayta ishga tushdi", "ok")
+        if values.get("Errors", "0") != "0" or code != 0:
+            self.log_line("Ba'zi Point and Print sozlamalarida xato yuz berdi.", "warn")
+
+    def point_and_print_gpo_fix(self) -> None:
+        """Domain GPO orqali Point and Print Restrictions siyosatini tarqatish.
+        
+        Bu faqat Domain Controller yoki RSAT/GroupPolicy moduli o'rnatilgan
+        kompyuterlarda ishlaydi. Agar GroupPolicy moduli topilmasa, o'tkazib yuboriladi.
+        """
+        self.log_section("Domain GPO Point and Print siyosati tekshiruvi")
+        script = r"""
+        $ErrorActionPreference = 'SilentlyContinue'
+        $summary = @{
+            GroupPolicyAvailable = 0
+            IsDomainJoined = 0
+            GpoExists = 0
+            GpoCreated = 0
+            GpoValuesSet = 0
+            Errors = 0
+        }
+
+        # Domain a'zoligi tekshirish
+        try {
+            $computerSystem = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
+            if ($computerSystem.PartOfDomain) {
+                $summary.IsDomainJoined = 1
+                Write-Output ("LOG: Kompyuter domen a'zosi: " + $computerSystem.Domain)
+            } else {
+                Write-Output 'LOG: Kompyuter domenga ulanmagan - GPO qismi o''tkazib yuborildi'
+                $summary.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }
+                exit 0
+            }
+        } catch {
+            Write-Output 'LOG: Domen holatini aniqlab bo''lmadi'
+            $summary.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }
+            exit 0
+        }
+
+        # GroupPolicy moduli tekshirish
+        if (Get-Module -ListAvailable -Name GroupPolicy) {
+            $summary.GroupPolicyAvailable = 1
+            Write-Output 'LOG: GroupPolicy moduli mavjud'
+        } else {
+            Write-Output 'LOG: GroupPolicy moduli topilmadi - RSAT o''rnatilmagan yoki DC emas'  
+            Write-Output 'LOG: GPO yaratish o''tkazib yuborildi. Local tuzatish qo''llanildi.'  
+            $summary.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }
+            exit 0
+        }
+
+        try {
+            Import-Module GroupPolicy -ErrorAction Stop
+            $gpoName = 'Printer - PointAndPrint Fix'
+
+            $gpo = Get-GPO -Name $gpoName -ErrorAction SilentlyContinue
+            if (-not $gpo) {
+                $gpo = New-GPO -Name $gpoName -Comment 'Tarmoq printerlariga ulanish xatosini tuzatish (Point and Print Restrictions) - FixPrint tomonidan yaratildi'
+                Write-Output ("LOG: GPO yaratildi: " + $gpoName)
+                $summary.GpoCreated = 1
+            } else {
+                Write-Output ("LOG: Mavjud GPO ishlatilmoqda: " + $gpoName)
+                $summary.GpoExists = 1
+            }
+
+            $regKey = 'HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Printers\PointAndPrint'
+            $settings = [ordered]@{
+                'RestrictDriverInstallationToAdministrators' = 0
+                'TrustedServers'                             = 0
+                'InForest'                                   = 0
+                'NoWarningNoElevationOnInstall'               = 1
+                'UpdatePromptSettings'                        = 0
+                'Restricted'                                  = 0
+            }
+
+            foreach ($name in $settings.Keys) {
+                Set-GPRegistryValue -Name $gpoName -Key $regKey -ValueName $name -Type DWord -Value $settings[$name] | Out-Null
+                Write-Output ("LOG: GPO: " + $name + " = " + $settings[$name])
+                $summary.GpoValuesSet++
+            }
+
+            $pkgRegKey = 'HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Printers\PackagePointAndPrint'
+            Set-GPRegistryValue -Name $gpoName -Key $pkgRegKey -ValueName 'PackagePointAndPrintOnly' -Type DWord -Value 0 | Out-Null
+            Set-GPRegistryValue -Name $gpoName -Key $pkgRegKey -ValueName 'PackagePointAndPrintServerList' -Type DWord -Value 0 | Out-Null
+            Write-Output 'LOG: GPO: PackagePointAndPrint qiymatlari yozildi'
+            $summary.GpoValuesSet += 2
+
+            Write-Output 'LOG: GPO tayyor. GPMC.msc orqali kerakli OU ga bog''lang'  
+            Write-Output 'LOG: Klient kompyuterlarda: gpupdate /force'
+        } catch {
+            Write-Output ("LOG: GPO yaratish/yangilashda xato: " + $_.Exception.Message)
+            $summary.Errors++
+        }
+
+        $summary.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }
+        """
+        code, out, _ = ps(script, 90)
+        values, messages = parse_script_output(out)
+        for message in messages:
+            self.log_line(message, "dim")
+
+        if values.get("IsDomainJoined", "0") == "0":
+            self.log_line("Kompyuter domenga ulanmagan - GPO qismi o'tkazib yuborildi.", "info")
+            return
+
+        if values.get("GroupPolicyAvailable", "0") == "0":
+            self.log_line("GroupPolicy moduli topilmadi (RSAT o'rnatilmagan). GPO o'tkazib yuborildi.", "warn")
+            return
+
+        gpo_values = values.get("GpoValuesSet", "0")
+        if values.get("GpoCreated", "0") == "1":
+            self.log_line("GPO yaratildi: 'Printer - PointAndPrint Fix'", "ok")
+        elif values.get("GpoExists", "0") == "1":
+            self.log_line("Mavjud GPO yangilandi: 'Printer - PointAndPrint Fix'", "ok")
+        if gpo_values != "0":
+            self.log_line(f"GPO registry qiymatlari yozildi: {gpo_values}", "ok")
+        if values.get("Errors", "0") != "0" or code != 0:
+            self.log_line("GPO yaratish/yangilashda xato yuz berdi.", "warn")
+        else:
+            self.log_line("GPO tayyor. GPMC.msc orqali kerakli OU'ga bog'lang.", "info")
 
 
     def configure_trusted_print_servers(self) -> None:
@@ -1779,6 +1990,8 @@ class App(tk.Tk):
         self.repair_print_core()
         self.set_progress("Tekshirilmoqda", "Registry sozlamalari yozilmoqda", BLUE)
         self.registry_fix()
+        self.set_progress("Tekshirilmoqda", "Point and Print siyosati tuzatilmoqda", BLUE)
+        self.point_and_print_policy_fix()
         self.set_progress("Kuting", "Spooler va queue tozalanmoqda", YELLOW)
         spooler_ready = self.spooler_fix()
         if not spooler_ready:
@@ -1809,6 +2022,8 @@ class App(tk.Tk):
         self.reconnect_discovered_server_shares()
         self.set_progress("Tekshirilmoqda", "Fallback queue lar yaratilmoqda", BLUE)
         self.create_fallback_local_queues()
+        self.set_progress("Tekshirilmoqda", "Domain GPO tekshirilmoqda", BLUE)
+        self.point_and_print_gpo_fix()
         self.set_progress("Tekshirilmoqda", "Yakuniy tekshiruv bajarilmoqda", BLUE)
         self.refresh_printers()
         self.log_line("Jarayon yakunlandi.", "ok")
