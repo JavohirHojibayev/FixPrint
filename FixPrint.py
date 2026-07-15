@@ -407,9 +407,25 @@ class App(tk.Tk):
         printer_box.pack(fill="x", padx=0, pady=(0, 10))
 
         self.label(parent, "2. AMALNI BAJARING")
+        
+        self.use_persistence = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            parent,
+            text="Doimiy himoyani yoqish (Tavsiya etiladi)",
+            variable=self.use_persistence,
+            font=("Segoe UI", 9),
+            bg=BG,
+            fg=TEXT,
+            selectcolor=PANEL,
+            activebackground=BG,
+            activeforeground=TEXT,
+            cursor="hand2"
+        ).pack(anchor="w", padx=0, pady=(0, 5))
+        
         self.button(parent, "Scriptni o'rnatish", lambda: self.start(self.full_fix), GREEN)
         self.button(parent, "Holatni tekshirish", lambda: self.start(self.refresh_printers), YELLOW)
         self.button(parent, "Logni tozalash", self.clear_log, GRAY, TEXT)
+
         status_box = tk.Frame(parent, bg=PANEL, highlightthickness=1, highlightbackground="#223245")
         status_box.pack(fill="x", pady=(18, 0))
         self.status = tk.Label(status_box, text="Tayyor", font=("Segoe UI", 12, "bold"), fg=GREEN, bg=PANEL)
@@ -453,6 +469,8 @@ class App(tk.Tk):
                 self.log.insert("end", text, tag)
                 self.log.see("end")
                 self.log.config(state="disabled")
+            elif action == "set_persistence_checkbox":
+                self.use_persistence.set(payload)
             elif action == "status":
                 text, color = payload
                 if text == LOADING_STATUS:
@@ -617,7 +635,82 @@ class App(tk.Tk):
         self.log_line("FixPrint tayyor.", "ok")
         self.log_line(f"Build: {APP_BUILD}", "info")
         self.log_line("Rejim: IP va printer tanlashsiz, faqat ushbu kompyuterni tuzatish.", "info")
+        self.start(self.check_persistence_status)
         self.start(self.refresh_printers)
+
+    def check_persistence_status(self) -> None:
+        self.log_section("Doimiy himoya holatini tekshirish")
+        code, out, _ = ps("Get-ScheduledTask -TaskName 'FixPrint_AutoRepair' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty State", 10)
+        if code == 0 and out.strip() in ["Ready", "Running"]:
+            self.log_line("Doimiy himoya YOQILGAN (Scheduled Task faol)", "ok")
+            self.ui.put(("status", ("Himoya faol", BLUE)))
+        else:
+            self.log_line("Doimiy himoya O'CHIRILGAN", "dim")
+
+    def enable_persistent_protection(self) -> None:
+        self.log_section("Doimiy himoyani yoqish")
+        script = r"""
+        $taskName = 'FixPrint_AutoRepair'
+        $actionScript = {
+            $ErrorActionPreference = 'SilentlyContinue'
+            $regPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers\PointAndPrint'
+            if (-not (Test-Path $regPath)) { New-Item -Path $regPath -Force | Out-Null }
+            $settings = @{
+                'RestrictDriverInstallationToAdministrators' = 0
+                'TrustedServers' = 0
+                'InForest' = 0
+                'NoWarningNoElevationOnInstall' = 1
+                'UpdatePromptSettings' = 0
+                'Restricted' = 0
+            }
+            foreach ($name in $settings.Keys) {
+                New-ItemProperty -Path $regPath -Name $name -PropertyType DWord -Value $settings[$name] -Force | Out-Null
+            }
+
+            $pkgPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers\PackagePointAndPrint'
+            if (-not (Test-Path $pkgPath)) { New-Item -Path $pkgPath -Force | Out-Null }
+            New-ItemProperty -Path $pkgPath -Name 'PackagePointAndPrintOnly' -PropertyType DWord -Value 0 -Force | Out-Null
+            New-ItemProperty -Path $pkgPath -Name 'PackagePointAndPrintServerList' -PropertyType DWord -Value 0 -Force | Out-Null
+
+            $rpcPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers\RPC'
+            if (-not (Test-Path $rpcPath)) { New-Item -Path $rpcPath -Force | Out-Null }
+            New-ItemProperty -Path $rpcPath -Name 'RpcUseNamedPipeProtocol' -PropertyType DWord -Value 1 -Force | Out-Null
+            New-ItemProperty -Path $rpcPath -Name 'RpcProtocols' -PropertyType DWord -Value 7 -Force | Out-Null
+
+            $svc = Get-Service -Name Spooler
+            if ($svc.Status -ne 'Running') {
+                Start-Service -Name Spooler
+            }
+        }
+
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($actionScript.ToString()))
+        $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -EncodedCommand $encoded"
+        
+        $trigger1 = New-ScheduledTaskTrigger -AtStartup
+        $trigger2 = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 30)
+        
+        $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
+
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($trigger1, $trigger2) -Principal $principal -Settings $settings | Out-Null
+        Write-Output "OK"
+        """
+        code, out, err = ps(script, 30)
+        if code == 0 and "OK" in out:
+            self.log_line("Doimiy himoya yoqildi. GPO o'zgarishlari avtomatik qaytariladi.", "ok")
+            self.ui.put(("status", ("Himoya faol", BLUE)))
+        else:
+            self.log_line(f"Himoyani yoqishda xato: {err or out}", "err")
+
+    def disable_persistent_protection(self) -> None:
+        self.log_section("Doimiy himoyani o'chirish")
+        code, out, err = ps("Unregister-ScheduledTask -TaskName 'FixPrint_AutoRepair' -Confirm:$false", 15)
+        if code == 0:
+            self.log_line("Doimiy himoya o'chirildi.", "ok")
+            self.ui.put(("status", ("Himoya o'chirilgan", MUTED)))
+        else:
+            self.log_line(f"Himoyani o'chirishda xato (ehtimol avval yoqilmagan): {err or out}", "dim")
 
     def apply_printers(self, printers: list[LocalPrinter]) -> None:
         self.printers = printers
@@ -2024,6 +2117,14 @@ class App(tk.Tk):
         self.create_fallback_local_queues()
         self.set_progress("Tekshirilmoqda", "Domain GPO tekshirilmoqda", BLUE)
         self.point_and_print_gpo_fix()
+        
+        if self.use_persistence.get():
+            self.set_progress("Tekshirilmoqda", "Doimiy himoya yoqilmoqda", BLUE)
+            self.enable_persistent_protection()
+        else:
+            self.set_progress("Tekshirilmoqda", "Doimiy himoya o'chirilmoqda", BLUE)
+            self.disable_persistent_protection()
+            
         self.set_progress("Tekshirilmoqda", "Yakuniy tekshiruv bajarilmoqda", BLUE)
         self.refresh_printers()
         self.log_line("Jarayon yakunlandi.", "ok")
