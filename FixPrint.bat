@@ -117,15 +117,6 @@ if %errorlevel%==0 (echo   [OK] RpcAuthnLevelPrivacyEnabled = 0) else (echo   [!
 reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\RPC" /v RpcAuthnLevelPrivacyEnabled /t REG_DWORD /d 0 /f >nul 2>&1
 if %errorlevel%==0 (echo   [OK] RPC\RpcAuthnLevelPrivacyEnabled = 0) else (echo   [!] RPC\RpcAuthnLevelPrivacyEnabled xato)
 
-reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\RPC" /v RpcUseNamedPipeProtocol /t REG_DWORD /d 1 /f >nul 2>&1
-if %errorlevel%==0 (echo   [OK] RpcUseNamedPipeProtocol = 1) else (echo   [!] RpcUseNamedPipeProtocol xato)
-
-reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\RPC" /v RpcProtocols /t REG_DWORD /d 7 /f >nul 2>&1
-if %errorlevel%==0 (echo   [OK] RpcProtocols = 7) else (echo   [!] RpcProtocols xato)
-
-reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\RPC" /v ForceKerberosForRpc /t REG_DWORD /d 0 /f >nul 2>&1
-if %errorlevel%==0 (echo   [OK] ForceKerberosForRpc = 0) else (echo   [!] ForceKerberosForRpc xato)
-
 reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers" /v DisableWebPnPDownload /t REG_DWORD /d 0 /f >nul 2>&1
 if %errorlevel%==0 (echo   [OK] DisableWebPnPDownload = 0) else (echo   [!] DisableWebPnPDownload xato)
 

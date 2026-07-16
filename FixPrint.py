@@ -720,8 +720,6 @@ class App(tk.Tk):
             # --- RPC ---
             $rpcPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers\RPC'
             if (-not (Test-Path $rpcPath)) { New-Item -Path $rpcPath -Force | Out-Null }
-            New-ItemProperty -Path $rpcPath -Name 'RpcUseNamedPipeProtocol' -PropertyType DWord -Value 1 -Force | Out-Null
-            New-ItemProperty -Path $rpcPath -Name 'RpcProtocols' -PropertyType DWord -Value 7 -Force | Out-Null
             New-ItemProperty -Path $rpcPath -Name 'RpcAuthnLevelPrivacyEnabled' -PropertyType DWord -Value 0 -Force | Out-Null
 
             # --- Umumiy printer siyosatlari ---
@@ -972,14 +970,9 @@ class App(tk.Tk):
         commands = [
             r'reg add "HKLM\System\CurrentControlSet\Control\Print" /v RpcAuthnLevelPrivacyEnabled /t REG_DWORD /d 0 /f',
             r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\RPC" /v RpcAuthnLevelPrivacyEnabled /t REG_DWORD /d 0 /f',
-            r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\RPC" /v RpcUseNamedPipeProtocol /t REG_DWORD /d 1 /f',
-            r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\RPC" /v RpcProtocols /t REG_DWORD /d 7 /f',
-            r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\RPC" /v ForceKerberosForRpc /t REG_DWORD /d 0 /f',
-            r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\RPC" /v Authentication /t REG_DWORD /d 0 /f',
-            r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\RPC" /v Protocol /t REG_DWORD /d 1 /f',
             r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v RestrictDriverInstallationToAdministrators /t REG_DWORD /d 0 /f',
             r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v NoWarningNoElevationOnInstall /t REG_DWORD /d 1 /f',
-            r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v UpdatePromptSettings /t REG_DWORD /d 2 /f',
+            r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v UpdatePromptSettings /t REG_DWORD /d 0 /f',
             r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v Restricted /t REG_DWORD /d 0 /f',
             r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v TrustedServers /t REG_DWORD /d 0 /f',
             r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v InForest /t REG_DWORD /d 0 /f',
@@ -1580,7 +1573,9 @@ class App(tk.Tk):
         aks holda eski siyosat qayta qo'llanishi mumkin.
         """
         self.log_section("Group Policy yangilash (gpupdate /force)")
-        code, out, err = run("gpupdate /force", 120)
+        # echo N qismi logoff so'roviga "Yo'q" deb javob beradi
+        # /Wait:0 buyruqning fonda ishlashini ta'minlab qotib qolishni oldini oladi
+        code, out, err = run("echo N | gpupdate /force /Wait:0", 60)
         if code == 0:
             self.log_line("Group Policy muvaffaqiyatli yangilandi.", "ok")
         else:
