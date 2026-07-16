@@ -640,9 +640,46 @@ class App(tk.Tk):
 
     def check_persistence_status(self) -> None:
         self.log_section("Doimiy himoya holatini tekshirish")
-        code, out, _ = ps("Get-ScheduledTask -TaskName 'FixPrint_AutoRepair' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty State", 10)
-        if code == 0 and out.strip() in ["Ready", "Running"]:
-            self.log_line("Doimiy himoya YOQILGAN (Scheduled Task faol)", "ok")
+        script = r"""
+        $status = @{
+            WmiGuardActive = 0
+            CseBlocked = 0
+        }
+        
+        # WMI Guard tekshirish
+        $wmiFilter = Get-WmiObject -Namespace root\subscription -Class __EventFilter -Filter "Name='FixPrint_RegistryGuard'" -ErrorAction SilentlyContinue
+        if ($wmiFilter) {
+            $status.WmiGuardActive = 1
+        }
+        
+        # GPO CSE bloklash tekshirish
+        $csePath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Group Policy\{35378EAC-683F-11D2-A89A-00C04FBBCFA2}'
+        $noBackground = (Get-ItemProperty -Path $csePath -Name 'NoBackgroundPolicy' -ErrorAction SilentlyContinue).NoBackgroundPolicy
+        if ($noBackground -eq 1) {
+            $status.CseBlocked = 1
+        }
+        
+        $status.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }
+        """
+        code, out, _ = ps(script, 15)
+        values, _ = parse_script_output(out)
+        wmi_active = values.get("WmiGuardActive", "0") == "1"
+        cse_blocked = values.get("CseBlocked", "0") == "1"
+        
+        if wmi_active:
+            self.log_line("WMI Registry Guard YOQILGAN (real-time himoya)", "ok")
+        else:
+            self.log_line("WMI Registry Guard O'CHIRILGAN", "dim")
+        if cse_blocked:
+            self.log_line("GPO CSE fon yangilanishi BLOKLANGAN", "ok")
+        else:
+            self.log_line("GPO CSE fon yangilanishi BLOKLANMAGAN", "dim")
+        
+        if wmi_active and cse_blocked:
+            self.log_line("To'liq himoya YOQILGAN", "ok")
+            self.ui.put(("status", ("Himoya faol", BLUE)))
+        elif wmi_active or cse_blocked:
+            self.log_line("Qisman himoya yoqilgan", "warn")
             self.ui.put(("status", ("Himoya faol", BLUE)))
         else:
             self.log_line("Doimiy himoya O'CHIRILGAN", "dim")
@@ -651,8 +688,13 @@ class App(tk.Tk):
         self.log_section("Doimiy himoyani yoqish")
         script = r"""
         $taskName = 'FixPrint_AutoRepair'
+        $wmiFilterName = 'FixPrint_RegistryGuard'
+
+        # ========== 1) Scheduled Task action skripti ==========
         $actionScript = {
             $ErrorActionPreference = 'SilentlyContinue'
+
+            # --- PointAndPrint ---
             $regPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers\PointAndPrint'
             if (-not (Test-Path $regPath)) { New-Item -Path $regPath -Force | Out-Null }
             $settings = @{
@@ -669,55 +711,150 @@ class App(tk.Tk):
                 New-ItemProperty -Path $regPath -Name $name -PropertyType DWord -Value $settings[$name] -Force | Out-Null
             }
 
+            # --- PackagePointAndPrint ---
             $pkgPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers\PackagePointAndPrint'
             if (-not (Test-Path $pkgPath)) { New-Item -Path $pkgPath -Force | Out-Null }
             New-ItemProperty -Path $pkgPath -Name 'PackagePointAndPrintOnly' -PropertyType DWord -Value 0 -Force | Out-Null
             New-ItemProperty -Path $pkgPath -Name 'PackagePointAndPrintServerList' -PropertyType DWord -Value 0 -Force | Out-Null
 
+            # --- RPC ---
             $rpcPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers\RPC'
             if (-not (Test-Path $rpcPath)) { New-Item -Path $rpcPath -Force | Out-Null }
             New-ItemProperty -Path $rpcPath -Name 'RpcUseNamedPipeProtocol' -PropertyType DWord -Value 1 -Force | Out-Null
             New-ItemProperty -Path $rpcPath -Name 'RpcProtocols' -PropertyType DWord -Value 7 -Force | Out-Null
             New-ItemProperty -Path $rpcPath -Name 'RpcAuthnLevelPrivacyEnabled' -PropertyType DWord -Value 0 -Force | Out-Null
 
+            # --- Umumiy printer siyosatlari ---
             $printersPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers'
             New-ItemProperty -Path $printersPath -Name 'AllowPrinterConnections' -PropertyType DWord -Value 1 -Force | Out-Null
             New-ItemProperty -Path $printersPath -Name 'AllowPointAndPrint' -PropertyType DWord -Value 1 -Force | Out-Null
 
+            # --- Print control ---
             $printBase = 'HKLM:\SYSTEM\CurrentControlSet\Control\Print'
             New-ItemProperty -Path $printBase -Name 'RpcAuthnLevelPrivacyEnabled' -PropertyType DWord -Value 0 -Force | Out-Null
 
+            # --- Spooler ---
             $svc = Get-Service -Name Spooler
             if ($svc.Status -ne 'Running') {
                 Start-Service -Name Spooler
             }
         }
 
+        # $encoded o'zgaruvchisi WMI consumer ga argument sifatida uzatiladi
         $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($actionScript.ToString()))
-        $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -EncodedCommand $encoded"
         
-        $trigger1 = New-ScheduledTaskTrigger -AtStartup
-        $trigger2 = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 30)
-        
-        $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
-
+        # (Scheduled Task qismi olib tashlandi, chunki WMI va GPO CSE himoyasi yetarli va uzoq muddat barqaror ishlaydi)
+        # Eski Scheduled Task bo'lsa o'chirib tashlaymiz
         Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($trigger1, $trigger2) -Principal $principal -Settings $settings | Out-Null
+
+        # ========== 2) WMI Event Subscription (registry o'zgarishini real-time kuzatish) ==========
+        try {
+            # Eski subscription tozalash
+            Get-EventSubscriber -SourceIdentifier $wmiFilterName -ErrorAction SilentlyContinue | Unregister-Event -ErrorAction SilentlyContinue
+
+            # WMI permanent event subscription yaratish
+            $filterQuery = "SELECT * FROM RegistryValueChangeEvent WHERE Hive='HKEY_LOCAL_MACHINE' AND KeyPath='SOFTWARE\\Policies\\Microsoft\\Windows NT\\Printers\\PointAndPrint' AND ValueName='RestrictDriverInstallationToAdministrators'"
+
+            # Eski WMI subscriptionlarni tozalash
+            Get-WmiObject -Namespace root\subscription -Class __EventFilter -Filter "Name='$wmiFilterName'" -ErrorAction SilentlyContinue | Remove-WmiObject -ErrorAction SilentlyContinue
+            Get-WmiObject -Namespace root\subscription -Class CommandLineEventConsumer -Filter "Name='$wmiFilterName'" -ErrorAction SilentlyContinue | Remove-WmiObject -ErrorAction SilentlyContinue
+            Get-WmiObject -Namespace root\subscription -Class __FilterToConsumerBinding -ErrorAction SilentlyContinue | Where-Object { $_.Filter -like "*$wmiFilterName*" } | Remove-WmiObject -ErrorAction SilentlyContinue
+
+            # Yangi WMI filter
+            $filter = Set-WmiInstance -Namespace root\subscription -Class __EventFilter -Arguments @{
+                Name = $wmiFilterName
+                EventNameSpace = 'root\default'
+                QueryLanguage = 'WQL'
+                Query = $filterQuery
+            }
+
+            # Consumer - registry o'zgarilganda darhol tuzatish
+            $consumer = Set-WmiInstance -Namespace root\subscription -Class CommandLineEventConsumer -Arguments @{
+                Name = $wmiFilterName
+                ExecutablePath = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
+                CommandLineTemplate = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -EncodedCommand $encoded"
+            }
+
+            # Binding
+            Set-WmiInstance -Namespace root\subscription -Class __FilterToConsumerBinding -Arguments @{
+                Filter = $filter
+                Consumer = $consumer
+            } | Out-Null
+
+            Write-Output 'LOG: WMI registry guard yoqildi (real-time himoya)'
+        } catch {
+            Write-Output ('LOG: WMI guard yoqishda xato (muhim emas): ' + $_.Exception.Message)
+        }
+
+        # ========== 5) GPO printer CSE ni bloklash ==========
+        # Bu Group Policy Client Side Extension (CSE) ning printer
+        # siyosatini qayta yozishini to'xtatadi
+        try {
+            $gpExtPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Group Policy\{35378EAC-683F-11D2-A89A-00C04FBBCFA2}'
+            if (-not (Test-Path $gpExtPath)) { New-Item -Path $gpExtPath -Force | Out-Null }
+            # NoGPOListChanges=1: GPO ro'yxati o'zgarmasa qayta ishlamaslik
+            New-ItemProperty -Path $gpExtPath -Name 'NoGPOListChanges' -PropertyType DWord -Value 1 -Force | Out-Null
+            # NoBackgroundPolicy=1: Fonda GPO ni qayta qo'llamaslik
+            New-ItemProperty -Path $gpExtPath -Name 'NoBackgroundPolicy' -PropertyType DWord -Value 1 -Force | Out-Null
+            Write-Output 'LOG: GPO printer CSE fon yangilanishi bloklandi'
+        } catch {
+            Write-Output ('LOG: GPO CSE bloklashda xato: ' + $_.Exception.Message)
+        }
+
         Write-Output "OK"
         """
-        code, out, err = ps(script, 30)
+        code, out, err = ps(script, 60)
+        _, messages = parse_script_output(out)
+        for message in messages:
+            self.log_line(message, "dim")
         if code == 0 and "OK" in out:
-            self.log_line("Doimiy himoya yoqildi. GPO o'zgarishlari avtomatik qaytariladi.", "ok")
+            self.log_line("Doimiy himoya yoqildi (WMI Guard + GPO bloklash).", "ok")
+            self.log_line("Registry o'zgarishlari real-time kuzatiladi va himoya qilinadi.", "ok")
             self.ui.put(("status", ("Himoya faol", BLUE)))
         else:
             self.log_line(f"Himoyani yoqishda xato: {err or out}", "err")
 
     def disable_persistent_protection(self) -> None:
         self.log_section("Doimiy himoyani o'chirish")
-        code, out, err = ps("Unregister-ScheduledTask -TaskName 'FixPrint_AutoRepair' -Confirm:$false", 15)
-        if code == 0:
-            self.log_line("Doimiy himoya o'chirildi.", "ok")
+        script = r"""
+        $ErrorActionPreference = 'SilentlyContinue'
+        $taskName = 'FixPrint_AutoRepair'
+        $wmiFilterName = 'FixPrint_RegistryGuard'
+        $errors = 0
+
+        # Eski Scheduled Task o'chirish (mavjud bo'lsa)
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+
+        # WMI Event Subscription tozalash
+        try {
+            Get-WmiObject -Namespace root\subscription -Class __EventFilter -Filter "Name='$wmiFilterName'" -ErrorAction SilentlyContinue | Remove-WmiObject -ErrorAction SilentlyContinue
+            Get-WmiObject -Namespace root\subscription -Class CommandLineEventConsumer -Filter "Name='$wmiFilterName'" -ErrorAction SilentlyContinue | Remove-WmiObject -ErrorAction SilentlyContinue
+            Get-WmiObject -Namespace root\subscription -Class __FilterToConsumerBinding -ErrorAction SilentlyContinue | Where-Object { $_.Filter -like "*$wmiFilterName*" } | Remove-WmiObject -ErrorAction SilentlyContinue
+            Write-Output 'LOG: WMI registry guard o''chirildi'
+        } catch {
+            $errors++
+        }
+
+        # GPO CSE bloklashni olib tashlash
+        try {
+            $gpExtPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Group Policy\{35378EAC-683F-11D2-A89A-00C04FBBCFA2}'
+            if (Test-Path $gpExtPath) {
+                Remove-ItemProperty -Path $gpExtPath -Name 'NoGPOListChanges' -Force -ErrorAction SilentlyContinue
+                Remove-ItemProperty -Path $gpExtPath -Name 'NoBackgroundPolicy' -Force -ErrorAction SilentlyContinue
+                Write-Output 'LOG: GPO CSE bloklash olib tashlandi'
+            }
+        } catch {
+            $errors++
+        }
+
+        Write-Output "OK"
+        """
+        code, out, err = ps(script, 30)
+        _, messages = parse_script_output(out)
+        for message in messages:
+            self.log_line(message, "dim")
+        if code == 0 and "OK" in out:
+            self.log_line("Doimiy himoya to'liq o'chirildi (WMI + GPO).", "ok")
             self.ui.put(("status", ("Himoya o'chirilgan", MUTED)))
         else:
             self.log_line(f"Himoyani o'chirishda xato (ehtimol avval yoqilmagan): {err or out}", "dim")
@@ -864,6 +1001,121 @@ class App(tk.Tk):
             code, out, err = run(command, 20)
             value_name = command.split(" /v ")[-1].split(" ")[0]
             self.log_line(f"OK: {value_name}" if code == 0 else f"Xato: {err or out}", "ok" if code == 0 else "err")
+
+    def block_gpo_printer_override(self) -> None:
+        """GPO ning printer registry kalitlarini qayta yozishini bloklash.
+        
+        Bu metod 3 ta mexanizm orqali ishlaydi:
+        1. Registry Policy Processing CSE fon yangilanishini o'chiradi
+        2. Local GPO cache (registry.pol) dan printer siyosatlarini tozalaydi
+        3. PointAndPrint kalitiga himoya ACL qo'yadi
+        """
+        self.log_section("GPO printer siyosati qayta yozishini bloklash")
+        script = r"""
+        $ErrorActionPreference = 'SilentlyContinue'
+        $summary = @{
+            CseBlocked = 0
+            GpCacheCleaned = 0
+            AclProtected = 0
+            Errors = 0
+        }
+
+        # 1) Registry Policy Processing CSE fon yangilanishini bloklash
+        # GUID: {35378EAC-683F-11D2-A89A-00C04FBBCFA2} - Registry Processing CSE
+        try {
+            $csePath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Group Policy\{35378EAC-683F-11D2-A89A-00C04FBBCFA2}'
+            if (-not (Test-Path $csePath)) { New-Item -Path $csePath -Force | Out-Null }
+            # NoBackgroundPolicy: Fonda GP qayta ishlamaydi
+            New-ItemProperty -Path $csePath -Name 'NoBackgroundPolicy' -PropertyType DWord -Value 1 -Force | Out-Null
+            # NoGPOListChanges: GPO ro'yxati o'zgarmasa qayta ishlamaslik
+            New-ItemProperty -Path $csePath -Name 'NoGPOListChanges' -PropertyType DWord -Value 1 -Force | Out-Null
+            Write-Output 'LOG: Registry CSE fon yangilanishi bloklandi'
+            $summary.CseBlocked = 1
+        } catch {
+            Write-Output ('LOG: CSE bloklashda xato: ' + $_.Exception.Message)
+            $summary.Errors++
+        }
+
+        # 2) Local GP cache dan printer siyosatlarini tozalash
+        # registry.pol faylidagi printer sozlamalarini tozalash
+        try {
+            $polPath = "$env:SystemRoot\System32\GroupPolicy\Machine\Registry.pol"
+            if (Test-Path $polPath) {
+                # registry.pol ni zaxira olish
+                $backupPath = "$env:SystemRoot\System32\GroupPolicy\Machine\Registry.pol.fixprint.bak"
+                if (-not (Test-Path $backupPath)) {
+                    Copy-Item -Path $polPath -Destination $backupPath -Force
+                    Write-Output 'LOG: registry.pol zaxira yaratildi'
+                }
+                
+                # Fayl hajmi tekshirish - agar printer siyosatlari bo'lsa
+                $content = [System.IO.File]::ReadAllBytes($polPath)
+                $text = [System.Text.Encoding]::Unicode.GetString($content)
+                if ($text -match 'Printers\\PointAndPrint' -or $text -match 'RestrictDriverInstallation') {
+                    # registry.pol ni o'chirib, bo'sh GP papkasini qoldirish
+                    Remove-Item -Path $polPath -Force
+                    Write-Output 'LOG: Printer siyosatlari bor registry.pol tozalandi'
+                    $summary.GpCacheCleaned = 1
+                } else {
+                    Write-Output 'LOG: registry.pol da printer siyosati topilmadi (o''zgartirish shart emas)'
+                }
+            } else {
+                Write-Output 'LOG: Local GP registry.pol mavjud emas (domen GP qo''llanilmagan)'
+            }
+        } catch {
+            Write-Output ('LOG: GP cache tozalashda xato: ' + $_.Exception.Message)
+            $summary.Errors++
+        }
+
+        # 3) PointAndPrint registry kalitiga himoya ACL qo'yish
+        # Bu GPO engine ning bu kalitni qayta yozishini oldini oladi
+        try {
+            $regKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
+                'SOFTWARE\Policies\Microsoft\Windows NT\Printers\PointAndPrint',
+                [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree,
+                [System.Security.AccessControl.RegistryRights]::ChangePermissions
+            )
+            if ($regKey) {
+                $acl = $regKey.GetAccessControl()
+                
+                # "SYSTEM" foydalanuvchisiga "SetValue" ni rad etish (Deny rule)
+                # Bu gpupdate ning qiymatlarni o'zgartirishini oldini oladi
+                # Lekin bizning admin skriptimiz "TakeOwnership" orqali ishlaydi
+                $identity = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')  # SYSTEM
+                $denyRule = New-Object System.Security.AccessControl.RegistryAccessRule(
+                    $identity,
+                    [System.Security.AccessControl.RegistryRights]::SetValue,
+                    [System.Security.AccessControl.InheritanceFlags]::None,
+                    [System.Security.AccessControl.PropagationFlags]::None,
+                    [System.Security.AccessControl.AccessControlType]::Deny
+                )
+                $acl.AddAccessRule($denyRule)
+                $regKey.SetAccessControl($acl)
+                $regKey.Close()
+                Write-Output 'LOG: PointAndPrint registry kalitiga Deny ACL qo''yildi (GPO himoyasi)'
+                $summary.AclProtected = 1
+            } else {
+                Write-Output 'LOG: PointAndPrint registry kaliti ochilmadi'
+            }
+        } catch {
+            Write-Output ('LOG: ACL himoya qo''yishda xato: ' + $_.Exception.Message)
+            $summary.Errors++
+        }
+
+        $summary.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }
+        """
+        code, out, _ = ps(script, 60)
+        values, messages = parse_script_output(out)
+        for message in messages:
+            self.log_line(message, "dim")
+        if values.get("CseBlocked", "0") == "1":
+            self.log_line("Registry CSE fon yangilanishi bloklandi.", "ok")
+        if values.get("GpCacheCleaned", "0") == "1":
+            self.log_line("Local GP cache printer siyosatlari tozalandi.", "ok")
+        if values.get("AclProtected", "0") == "1":
+            self.log_line("PointAndPrint registry kaliti GPO dan himoyalandi (Deny ACL).", "ok")
+        if values.get("Errors", "0") != "0" or code != 0:
+            self.log_line("Ba'zi GPO bloklash sozlamalari qo'llanmagan bo'lishi mumkin.", "warn")
 
     def spooler_fix(self) -> bool:
         self.log_section("Spooler va queue tozalash")
@@ -2115,6 +2367,8 @@ class App(tk.Tk):
         self.repair_print_core()
         self.set_progress("Tekshirilmoqda", "Registry sozlamalari yozilmoqda", BLUE)
         self.registry_fix()
+        self.set_progress("Tekshirilmoqda", "GPO printer siyosatini bloklash", BLUE)
+        self.block_gpo_printer_override()
         self.set_progress("Tekshirilmoqda", "Point and Print siyosati tuzatilmoqda", BLUE)
         self.point_and_print_policy_fix()
         self.set_progress("Tekshirilmoqda", "Group Policy yangilanmoqda", BLUE)

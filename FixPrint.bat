@@ -91,6 +91,12 @@ if %errorlevel%==0 (echo   [OK] UpdatePromptSettings = 0) else (echo   [!] Updat
 reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v Restricted /t REG_DWORD /d 0 /f >nul 2>&1
 if %errorlevel%==0 (echo   [OK] Restricted = 0) else (echo   [!] Restricted xato)
 
+reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v NoElevationOnInstall /t REG_DWORD /d 1 /f >nul 2>&1
+if %errorlevel%==0 (echo   [OK] NoElevationOnInstall = 1) else (echo   [!] NoElevationOnInstall xato)
+
+reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v CopyFilesPolicy /t REG_DWORD /d 1 /f >nul 2>&1
+if %errorlevel%==0 (echo   [OK] CopyFilesPolicy = 1) else (echo   [!] CopyFilesPolicy xato)
+
 echo.
 echo  == 2-QISM: PackagePointAndPrint registry sozlamalari ==
 echo.
@@ -126,8 +132,24 @@ if %errorlevel%==0 (echo   [OK] DisableWebPnPDownload = 0) else (echo   [!] Disa
 reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers" /v DisableHTTPPrinting /t REG_DWORD /d 0 /f >nul 2>&1
 if %errorlevel%==0 (echo   [OK] DisableHTTPPrinting = 0) else (echo   [!] DisableHTTPPrinting xato)
 
+reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers" /v AllowPrinterConnections /t REG_DWORD /d 1 /f >nul 2>&1
+if %errorlevel%==0 (echo   [OK] AllowPrinterConnections = 1) else (echo   [!] AllowPrinterConnections xato)
+
+reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers" /v AllowPointAndPrint /t REG_DWORD /d 1 /f >nul 2>&1
+if %errorlevel%==0 (echo   [OK] AllowPointAndPrint = 1) else (echo   [!] AllowPointAndPrint xato)
+
 echo.
-echo  == 4-QISM: Print Spooler qayta ishga tushirish ==
+echo  == 4-QISM: GPO Printer CSE Bloklash ==
+echo.
+
+reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\Group Policy\{35378EAC-683F-11D2-A89A-00C04FBBCFA2}" /v NoBackgroundPolicy /t REG_DWORD /d 1 /f >nul 2>&1
+if %errorlevel%==0 (echo   [OK] GPO NoBackgroundPolicy = 1) else (echo   [!] GPO NoBackgroundPolicy xato)
+
+reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\Group Policy\{35378EAC-683F-11D2-A89A-00C04FBBCFA2}" /v NoGPOListChanges /t REG_DWORD /d 1 /f >nul 2>&1
+if %errorlevel%==0 (echo   [OK] GPO NoGPOListChanges = 1) else (echo   [!] GPO NoGPOListChanges xato)
+
+echo.
+echo  == 5-QISM: Print Spooler qayta ishga tushirish ==
 echo.
 
 echo   Spooler to'xtatilmoqda...
