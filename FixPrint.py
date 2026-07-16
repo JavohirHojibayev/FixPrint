@@ -662,6 +662,8 @@ class App(tk.Tk):
                 'NoWarningNoElevationOnInstall' = 1
                 'UpdatePromptSettings' = 0
                 'Restricted' = 0
+                'NoElevationOnInstall' = 1
+                'CopyFilesPolicy' = 1
             }
             foreach ($name in $settings.Keys) {
                 New-ItemProperty -Path $regPath -Name $name -PropertyType DWord -Value $settings[$name] -Force | Out-Null
@@ -676,6 +678,14 @@ class App(tk.Tk):
             if (-not (Test-Path $rpcPath)) { New-Item -Path $rpcPath -Force | Out-Null }
             New-ItemProperty -Path $rpcPath -Name 'RpcUseNamedPipeProtocol' -PropertyType DWord -Value 1 -Force | Out-Null
             New-ItemProperty -Path $rpcPath -Name 'RpcProtocols' -PropertyType DWord -Value 7 -Force | Out-Null
+            New-ItemProperty -Path $rpcPath -Name 'RpcAuthnLevelPrivacyEnabled' -PropertyType DWord -Value 0 -Force | Out-Null
+
+            $printersPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers'
+            New-ItemProperty -Path $printersPath -Name 'AllowPrinterConnections' -PropertyType DWord -Value 1 -Force | Out-Null
+            New-ItemProperty -Path $printersPath -Name 'AllowPointAndPrint' -PropertyType DWord -Value 1 -Force | Out-Null
+
+            $printBase = 'HKLM:\SYSTEM\CurrentControlSet\Control\Print'
+            New-ItemProperty -Path $printBase -Name 'RpcAuthnLevelPrivacyEnabled' -PropertyType DWord -Value 0 -Force | Out-Null
 
             $svc = Get-Service -Name Spooler
             if ($svc.Status -ne 'Running') {
@@ -833,6 +843,13 @@ class App(tk.Tk):
             r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v RestrictDriverInstallationToAdministrators /t REG_DWORD /d 0 /f',
             r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v NoWarningNoElevationOnInstall /t REG_DWORD /d 1 /f',
             r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v UpdatePromptSettings /t REG_DWORD /d 2 /f',
+            r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v Restricted /t REG_DWORD /d 0 /f',
+            r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v TrustedServers /t REG_DWORD /d 0 /f',
+            r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v InForest /t REG_DWORD /d 0 /f',
+            r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v NoElevationOnInstall /t REG_DWORD /d 1 /f',
+            r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v CopyFilesPolicy /t REG_DWORD /d 1 /f',
+            r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PackagePointAndPrint" /v PackagePointAndPrintOnly /t REG_DWORD /d 0 /f',
+            r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PackagePointAndPrint" /v PackagePointAndPrintServerList /t REG_DWORD /d 0 /f',
             r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers" /v DisableWebPnPDownload /t REG_DWORD /d 0 /f',
             r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers" /v DisableHTTPPrinting /t REG_DWORD /d 0 /f',
             r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers" /v DisableRPCOverTCP /t REG_DWORD /d 0 /f',
@@ -840,6 +857,8 @@ class App(tk.Tk):
             r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers" /v RegisterSpoolerRemoteRpcEndPoint /t REG_DWORD /d 1 /f',
             r'reg add "HKLM\System\CurrentControlSet\Control\Print\Providers\LanMan Print Services\Servers" /v AddPrinterDrivers /t REG_DWORD /d 1 /f',
             r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers" /v AllowUserManageForms /t REG_DWORD /d 1 /f',
+            r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers" /v AllowPrinterConnections /t REG_DWORD /d 1 /f',
+            r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers" /v AllowPointAndPrint /t REG_DWORD /d 1 /f',
         ]
         for command in commands:
             code, out, err = run(command, 20)
@@ -1301,6 +1320,19 @@ class App(tk.Tk):
             self.log_line("Print Spooler muvaffaqiyatli qayta ishga tushdi", "ok")
         if values.get("Errors", "0") != "0" or code != 0:
             self.log_line("Ba'zi Point and Print sozlamalarida xato yuz berdi.", "warn")
+
+    def gpupdate_force(self) -> None:
+        """Group Policy keshini yangilash.
+        
+        Registry o'zgarishlaridan keyin GPO keshini tozalash shart,
+        aks holda eski siyosat qayta qo'llanishi mumkin.
+        """
+        self.log_section("Group Policy yangilash (gpupdate /force)")
+        code, out, err = run("gpupdate /force", 120)
+        if code == 0:
+            self.log_line("Group Policy muvaffaqiyatli yangilandi.", "ok")
+        else:
+            self.log_line(f"gpupdate /force xatosi (domen tarmog'ida emas bo'lishi mumkin): {err or out}", "warn")
 
     def point_and_print_gpo_fix(self) -> None:
         """Domain GPO orqali Point and Print Restrictions siyosatini tarqatish.
@@ -2085,6 +2117,8 @@ class App(tk.Tk):
         self.registry_fix()
         self.set_progress("Tekshirilmoqda", "Point and Print siyosati tuzatilmoqda", BLUE)
         self.point_and_print_policy_fix()
+        self.set_progress("Tekshirilmoqda", "Group Policy yangilanmoqda", BLUE)
+        self.gpupdate_force()
         self.set_progress("Kuting", "Spooler va queue tozalanmoqda", YELLOW)
         spooler_ready = self.spooler_fix()
         if not spooler_ready:
