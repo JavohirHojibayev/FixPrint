@@ -130,6 +130,27 @@ reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers" /v AllowPointAndP
 if %errorlevel%==0 (echo   [OK] AllowPointAndPrint = 1) else (echo   [!] AllowPointAndPrint xato)
 
 echo.
+echo  == 3.5-QISM: SMB xavfsizlik va Discovery servislari ==
+echo.
+
+reg add "HKLM\System\CurrentControlSet\Services\LanmanWorkstation\Parameters" /v RequireSecuritySignature /t REG_DWORD /d 0 /f >nul 2>&1
+if %errorlevel%==0 (echo   [OK] RequireSecuritySignature = 0) else (echo   [!] RequireSecuritySignature xato)
+
+reg add "HKLM\System\CurrentControlSet\Services\LanmanWorkstation\Parameters" /v EnableSecuritySignature /t REG_DWORD /d 1 /f >nul 2>&1
+if %errorlevel%==0 (echo   [OK] EnableSecuritySignature = 1) else (echo   [!] EnableSecuritySignature xato)
+
+echo   Discovery servislari yoqilmoqda...
+sc config fdPHost start= auto >nul 2>&1
+sc config FDResPub start= auto >nul 2>&1
+sc config SSDPSRV start= auto >nul 2>&1
+sc config upnphost start= auto >nul 2>&1
+net start fdPHost >nul 2>&1
+net start FDResPub >nul 2>&1
+net start SSDPSRV >nul 2>&1
+net start upnphost >nul 2>&1
+echo   [OK] Discovery servislari yoqildi
+
+echo.
 echo  == 4-QISM: GPO Printer CSE Bloklash ==
 echo.
 
@@ -140,7 +161,38 @@ reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\Group Policy\{35378EAC-683F-11
 if %errorlevel%==0 (echo   [OK] GPO NoGPOListChanges = 1) else (echo   [!] GPO NoGPOListChanges xato)
 
 echo.
-echo  == 5-QISM: Print Spooler qayta ishga tushirish ==
+echo  == 5-QISM: Doimiy Himoya (Scheduled Task va WMI Guard) ==
+echo.
+
+if not exist "%ProgramData%\FixPrint" mkdir "%ProgramData%\FixPrint" >nul 2>&1
+(
+  echo @echo off
+  echo reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v RestrictDriverInstallationToAdministrators /t REG_DWORD /d 0 /f ^>nul 2^>^&1
+  echo reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v NoWarningNoElevationOnInstall /t REG_DWORD /d 1 /f ^>nul 2^>^&1
+  echo reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\RPC" /v RpcAuthnLevelPrivacyEnabled /t REG_DWORD /d 0 /f ^>nul 2^>^&1
+  echo reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\RPC" /v RpcUseNamedPipeProtocol /t REG_DWORD /d 1 /f ^>nul 2^>^&1
+  echo reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\RPC" /v RpcProtocols /t REG_DWORD /d 7 /f ^>nul 2^>^&1
+  echo reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\RPC" /v ForceKerberosForRpc /t REG_DWORD /d 0 /f ^>nul 2^>^&1
+  echo reg add "HKLM\System\CurrentControlSet\Services\LanmanWorkstation\Parameters" /v AllowInsecureGuestAuth /t REG_DWORD /d 1 /f ^>nul 2^>^&1
+  echo reg add "HKLM\System\CurrentControlSet\Control\Print" /v RpcAuthnLevelPrivacyEnabled /t REG_DWORD /d 0 /f ^>nul 2^>^&1
+  echo reg add "HKLM\System\CurrentControlSet\Services\LanmanWorkstation\Parameters" /v RequireSecuritySignature /t REG_DWORD /d 0 /f ^>nul 2^>^&1
+  echo reg add "HKLM\System\CurrentControlSet\Services\LanmanWorkstation\Parameters" /v EnableSecuritySignature /t REG_DWORD /d 1 /f ^>nul 2^>^&1
+  echo net start Spooler ^>nul 2^>^&1
+  echo sc config fdPHost start= auto ^>nul 2^>^&1
+  echo sc config FDResPub start= auto ^>nul 2^>^&1
+  echo sc config SSDPSRV start= auto ^>nul 2^>^&1
+  echo sc config upnphost start= auto ^>nul 2^>^&1
+  echo net start fdPHost ^>nul 2^>^&1
+  echo net start FDResPub ^>nul 2^>^&1
+  echo net start SSDPSRV ^>nul 2^>^&1
+  echo net start upnphost ^>nul 2^>^&1
+) > "%ProgramData%\FixPrint\AutoRepair.cmd"
+
+schtasks /create /tn "FixPrint_AutoRepair" /tr "\"%ProgramData%\FixPrint\AutoRepair.cmd\"" /sc HOURLY /mo 1 /ru "NT AUTHORITY\SYSTEM" /rl HIGHEST /f >nul 2>&1
+if %errorlevel%==0 (echo   [OK] Scheduled Task FixPrint_AutoRepair yaratildi) else (echo   [!] Scheduled Task yaratishda ogohlantirish)
+
+echo.
+echo  == 6-QISM: Print Spooler qayta ishga tushirish ==
 echo.
 
 echo   Spooler to'xtatilmoqda...
@@ -160,7 +212,7 @@ if %errorlevel%==0 (
 
 echo.
 echo  ==============================================================
-echo   TAYYOR!
+echo   TAYYOR! Doimiy himoya yoqildi va sozlamalar saqlandi.
 echo  ==============================================================
 echo.
 echo   Shu kompyuterda printer ulanishi darhol ishlashi kerak.
@@ -214,7 +266,7 @@ echo.
 REM EXE yasash (ikonka bilan yoki ikonkasiz)
 if exist fixprint.ico (
     echo  Ikonka fayli topildi: fixprint.ico
-    python -m PyInstaller --onefile --noconsole --uac-admin --name FixPrint --icon=fixprint.ico FixPrint.py
+    python -m PyInstaller --onefile --noconsole --uac-admin --add-data "fixprint.ico;." --name FixPrint --icon=fixprint.ico FixPrint.py
 ) else (
     echo  Ikonka fayli topilmadi, ikonkasiz yasalmoqda...
     python -m PyInstaller --onefile --noconsole --uac-admin --name FixPrint FixPrint.py

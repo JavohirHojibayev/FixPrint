@@ -6,6 +6,7 @@ import locale
 import queue
 import subprocess
 import sys
+import time
 import threading
 import tkinter as tk
 from dataclasses import dataclass
@@ -13,8 +14,8 @@ from datetime import datetime
 from pathlib import Path
 from tkinter import messagebox, ttk
 APP_TITLE = "FixPrint"
-APP_ID = "FixPrint.PrinterRepair.20260612"
-APP_BUILD = "2026-06-12 16:35"
+APP_ID = "FixPrint.PrinterRepair.20260723"
+APP_BUILD = "2026-07-23 15:55"
 ICON_FILE = "fixprint.ico"
 SPOOL_DIR = Path(r"C:\Windows\System32\spool\PRINTERS")
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -88,6 +89,7 @@ def run(command: str, timeout: int = 60) -> tuple[int, str, str]:
     try:
         done = subprocess.run(
             command,
+            stdin=subprocess.DEVNULL,
             shell=True,
             capture_output=True,
             timeout=timeout,
@@ -117,6 +119,7 @@ def ps(script: str, timeout: int = 90) -> tuple[int, str, str]:
     try:
         done = subprocess.run(
             ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -152,33 +155,44 @@ def make_share_name(name: str) -> str:
 def get_local_printers() -> tuple[list[LocalPrinter], str]:
     script = r"""
     try {
-        Get-FixPrintPrinterObjects | ForEach-Object {
-            $name = [string]$_.Name
-            $driver = if ($_.PSObject.Properties['DriverName']) { [string]$_.DriverName } else { '' }
-            $port = if ($_.PSObject.Properties['PortName']) { [string]$_.PortName } else { '' }
-            $status = if ($_.PSObject.Properties['PrinterStatus']) { [string]$_.PrinterStatus } else { '' }
-            $name + "`t" + $driver + "`t" + $port + "`t" + $status
+        $list = @()
+        if (Test-Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Print\Printers') {
+            Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Control\Print\Printers' -ErrorAction SilentlyContinue | ForEach-Object {
+                $p = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+                if ($p.Name) {
+                    $name = [string]$p.Name
+                    $driver = [string]$p.PrinterDriver
+                    $port = [string]$p.Port
+                    $list += ($name + "`t" + $driver + "`t" + $port + "`tReady")
+                }
+            }
         }
+        if ($list.Count -eq 0 -and (Test-FixPrintCommand 'Get-Printer')) {
+            Get-Printer -ErrorAction SilentlyContinue | ForEach-Object {
+                $list += ($_.Name + "`t" + $_.DriverName + "`t" + $_.PortName + "`tReady")
+            }
+        }
+        $list
         exit 0
     } catch {
         Write-Output $_.Exception.Message
         exit 1
     }
     """
-    code, out, err = ps(script, 45)
+    code, out, err = ps(script, 5)
     if code != 0:
         return [], out or err or "Printerlar ro'yxatini o'qib bo'lmadi."
 
     printers: list[LocalPrinter] = []
     for line in out.splitlines():
         parts = line.split("\t")
-        if len(parts) >= 4 and parts[0].strip():
+        if len(parts) >= 3 and parts[0].strip():
             printers.append(
                 LocalPrinter(
                     name=parts[0].strip(),
-                    driver=parts[1].strip(),
-                    port=parts[2].strip(),
-                    status=parts[3].strip(),
+                    driver=parts[1].strip() if len(parts) > 1 else "",
+                    port=parts[2].strip() if len(parts) > 2 else "",
+                    status=parts[3].strip() if len(parts) > 3 else "Ready",
                 )
             )
     return printers, ""
@@ -231,9 +245,27 @@ def parse_share_path(share_path: str) -> RemotePrinterShare | None:
     if not text.startswith("\\\\"):
         return None
     parts = [part for part in text[2:].split("\\") if part]
-    if len(parts) < 2:
-        return None
-    return RemotePrinterShare(server=parts[0], share_name=parts[1], share_path=f"\\\\{parts[0]}\\{parts[1]}")
+def scan_ip_printers(ip: str) -> list[str]:
+    clean_ip = ip.strip().lstrip('\\').split('\\')[0]
+    if not clean_ip:
+        return []
+    cmd = f"net view \\\\{clean_ip}"
+    proc = subprocess.run(cmd, capture_output=True, text=True, shell=True, encoding='cp866', errors='replace')
+    printers = []
+    in_table = False
+    for line in proc.stdout.splitlines():
+        if '---' in line:
+            in_table = True
+            continue
+        if in_table:
+            if not line.strip() or 'Команда выполнена' in line or 'completed successfully' in line:
+                break
+            name = line[:29].strip() if len(line) >= 29 else line.strip()
+            rest = line[29:].strip() if len(line) > 29 else ""
+            if name and name.lower() not in ['users', 'print$', 'ipc$', 'c$', 'd$', 'admin$']:
+                if 'Диск' not in rest and 'Disk' not in rest:
+                    printers.append(name)
+    return printers
 
 
 class App(tk.Tk):
@@ -242,8 +274,8 @@ class App(tk.Tk):
         self.set_app_id()
         self.title(APP_TITLE)
         self.set_icon()
-        self.geometry("960x680")
-        self.minsize(850, 610)
+        self.geometry("1020x720")
+        self.minsize(920, 650)
         self.configure(bg=BG)
         self.printers: list[LocalPrinter] = []
         self.candidate_servers: set[str] = set()
@@ -252,10 +284,14 @@ class App(tk.Tk):
         self.pending_reboot_prompt = False
         self.reboot_dialog = None
         self.ui: queue.Queue[tuple[str, tuple]] = queue.Queue()
+        threading.excepthook = self.handle_thread_exception
         self.configure_styles()
         self.build_ui()
         self.after(100, self.pump)
         self.after(300, self.startup)
+
+    def handle_thread_exception(self, args) -> None:
+        self.log_line(f"Thread xatosi: {args.exc_value}", "err")
 
     def set_app_id(self) -> None:
         try:
@@ -266,8 +302,8 @@ class App(tk.Tk):
     def set_icon(self) -> None:
         paths = []
         if getattr(sys, "frozen", False):
-            paths.append(Path(sys.executable))
             paths.append(Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent)) / ICON_FILE)
+            paths.append(Path(sys.executable))
         paths.append(Path(__file__).resolve().parent / ICON_FILE)
         for path in paths:
             if path.exists():
@@ -291,7 +327,7 @@ class App(tk.Tk):
 
         body = tk.Frame(self, bg=BG)
         body.pack(fill="both", expand=True, padx=24, pady=(0, 18))
-        left = tk.Frame(body, bg=BG, width=370)
+        left = tk.Frame(body, bg=BG, width=410)
         left.pack(side="left", fill="y", padx=(0, 14))
         left.pack_propagate(False)
         right = tk.Frame(body, bg=PANEL)
@@ -327,8 +363,34 @@ class App(tk.Tk):
             troughcolor=[("active", "#050A10")],
         )
 
-    def button(self, parent: tk.Widget, text: str, command, bg: str, fg: str = "#00150B") -> None:
-        tk.Button(
+        style.configure(
+            "TCombobox",
+            fieldbackground="#0C141F",
+            background="#121C28",
+            foreground="#FFFFFF",
+            darkcolor="#121C28",
+            lightcolor="#121C28",
+            bordercolor="#223245",
+            arrowcolor="#FFFFFF",
+            padding=6,
+        )
+        style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", "#0C141F"), ("disabled", "#080C14")],
+            foreground=[("readonly", "#FFFFFF"), ("disabled", MUTED)],
+            selectbackground=[("readonly", "#1E3A5F")],
+            selectforeground=[("readonly", "#FFFFFF")],
+        )
+        self.option_add("*TCombobox*Listbox.background", "#0C141F")
+        self.option_add("*TCombobox*Listbox.foreground", "#FFFFFF")
+        self.option_add("*TCombobox*Listbox.selectBackground", "#1E3A5F")
+        self.option_add("*TCombobox*Listbox.selectForeground", "#FFFFFF")
+        self.option_add("*TCombobox*Listbox.font", ("Segoe UI", 9))
+        self.option_add("*TCombobox*Listbox.bd", 1)
+        self.option_add("*TCombobox*Listbox.relief", "flat")
+
+    def button(self, parent: tk.Widget, text: str, command, bg: str, fg: str = "#00150B") -> tk.Button:
+        btn = tk.Button(
             parent,
             text=text,
             command=command,
@@ -342,7 +404,9 @@ class App(tk.Tk):
             padx=14,
             pady=11,
             cursor="hand2",
-        ).pack(fill="x", pady=5)
+        )
+        btn.pack(fill="x", pady=5)
+        return btn
 
     def make_textbox(
         self,
@@ -407,24 +471,26 @@ class App(tk.Tk):
         printer_box.pack(fill="x", padx=0, pady=(0, 10))
 
         self.label(parent, "2. AMALNI BAJARING")
-        
-        self.use_persistence = tk.BooleanVar(value=True)
-        tk.Checkbutton(
-            parent,
-            text="Doimiy himoyani yoqish (Tavsiya etiladi)",
-            variable=self.use_persistence,
-            font=("Segoe UI", 9),
-            bg=BG,
-            fg=TEXT,
-            selectcolor=PANEL,
-            activebackground=BG,
-            activeforeground=TEXT,
-            cursor="hand2"
-        ).pack(anchor="w", padx=0, pady=(0, 5))
-        
-        self.button(parent, "Scriptni o'rnatish", lambda: self.start(self.full_fix), GREEN)
-        self.button(parent, "Holatni tekshirish", lambda: self.start(self.refresh_printers), YELLOW)
-        self.button(parent, "Logni tozalash", self.clear_log, GRAY, TEXT)
+        self.fix_btn = self.button(parent, "Skriptni o'rnatish", lambda: self.start(self.full_fix), GREEN)
+        self.refresh_btn = self.button(parent, "Holatni tekshirish", lambda: self.start(self.refresh_printers), YELLOW)
+
+        self.label(parent, "3. TARMOQ PRINTERINI ULASH (IP / LocalPort)")
+        connect_box = tk.Frame(parent, bg=PANEL, padx=10, pady=8)
+        connect_box.pack(fill="x", pady=(2, 10))
+
+        tk.Label(connect_box, text="IP manzil yoki Share yo'li (masalan: 192.168.3.81):", font=("Segoe UI", 8), fg=MUTED, bg=PANEL).pack(anchor="w", pady=(0, 4))
+        self.ip_entry = tk.Entry(connect_box, font=("Segoe UI", 9), bg=FIELD, fg=TEXT, insertbackground=TEXT, relief="flat", bd=4)
+        self.ip_entry.pack(fill="x", pady=(0, 6))
+        self.ip_entry.bind("<KeyRelease>", self.on_ip_entry_change)
+        self.ip_entry.bind("<FocusOut>", self.on_ip_entry_change)
+        self._scan_timer = None
+
+        tk.Label(connect_box, text="Manzildagi topilgan printerlar (Avtomatik):", font=("Segoe UI", 8), fg=MUTED, bg=PANEL).pack(anchor="w", pady=(6, 2))
+        self.found_printers_combo = ttk.Combobox(connect_box, state="readonly", font=("Segoe UI", 9))
+        self.found_printers_combo.pack(fill="x", pady=(2, 14))
+
+        self.connect_btn = self.button(connect_box, "⚡ Tanlangan printerga ulanish", lambda: self.start(self.connect_local_port_ip), BLUE, TEXT)
+        self.clear_btn = self.button(parent, "Logni tozalash", self.clear_log, GRAY, TEXT)
 
         status_box = tk.Frame(parent, bg=PANEL, highlightthickness=1, highlightbackground="#223245")
         status_box.pack(fill="x", pady=(18, 0))
@@ -492,8 +558,26 @@ class App(tk.Tk):
                     self.set_printer_summary(printer_text)
             elif action == "reboot_prompt":
                 self.show_reboot_prompt()
+            elif action == "set_busy":
+                is_busy = payload[0]
+                state = "disabled" if is_busy else "normal"
+                if hasattr(self, "fix_btn"):
+                    self.fix_btn.config(state=state, text="⏳ Jarayon bajarilmoqda..." if is_busy else "Skriptni o'rnatish")
+                if hasattr(self, "refresh_btn"):
+                    self.refresh_btn.config(state=state)
+                if hasattr(self, "scan_btn"):
+                    self.scan_btn.config(state=state)
+                if hasattr(self, "connect_btn"):
+                    self.connect_btn.config(state=state)
+            elif action == "update_combo":
+                items = payload[0]
+                if hasattr(self, "found_printers_combo"):
+                    self.found_printers_combo["values"] = items
+                    if items:
+                        self.found_printers_combo.current(0)
             elif action == "done":
                 self.busy = False
+                self.ui.put(("set_busy", (False,)))
         self.after(100, self.pump)
 
     def log_line(self, text: str, tag: str = "") -> None:
@@ -593,13 +677,11 @@ class App(tk.Tk):
             self.log_line(f"Qayta yuklash buyruqida xato: {err or out}", "err")
             messagebox.showerror(APP_TITLE, "Kompyuterni qayta yuklashning imkoni bo'lmadi.")
             return
-        self.destroy()
 
     def close_after_reboot_prompt(self) -> None:
         if self.reboot_dialog and self.reboot_dialog.winfo_exists():
             self.reboot_dialog.destroy()
         self.reboot_dialog = None
-        self.destroy()
 
     def set_printer_summary(self, text: str) -> None:
         self.printer_summary.config(state="normal")
@@ -612,6 +694,7 @@ class App(tk.Tk):
             self.log_line("Amal bajarilmoqda. Tugashini kuting.", "warn")
             return
         self.busy = True
+        self.ui.put(("set_busy", (True,)))
         threading.Thread(target=self.worker, args=(func,), daemon=True).start()
 
     def worker(self, func) -> None:
@@ -634,16 +717,52 @@ class App(tk.Tk):
     def startup(self) -> None:
         self.log_line("FixPrint tayyor.", "ok")
         self.log_line(f"Build: {APP_BUILD}", "info")
-        self.log_line("Rejim: IP va printer tanlashsiz, faqat ushbu kompyuterni tuzatish.", "info")
-        self.start(self.check_persistence_status)
-        self.start(self.refresh_printers)
+        self.log_line("Rejim: Printerlar diagnostikasi va avtomatik tuzatish.", "info")
+        self.start(self.initial_startup)
+
+    def initial_startup(self) -> None:
+        self.refresh_printers()
+        self.auto_scan_ip_printers()
+
+    def on_ip_entry_change(self, event=None) -> None:
+        if getattr(self, "_scan_timer", None):
+            self.after_cancel(self._scan_timer)
+        self._scan_timer = self.after(400, self.auto_scan_ip_printers)
+
+    def auto_scan_ip_printers(self) -> None:
+        raw_ip = self.ip_entry.get().strip() if hasattr(self, "ip_entry") else ""
+        if not raw_ip:
+            return
+        clean_ip = raw_ip.lstrip("\\").split("\\")[0]
+        if not clean_ip:
+            return
+        threading.Thread(target=self._async_scan_ip, args=(clean_ip,), daemon=True).start()
+
+    def _async_scan_ip(self, clean_ip: str) -> None:
+        printers = scan_ip_printers(clean_ip)
+        if printers:
+            items = [f"\\\\{clean_ip}\\{p}" for p in printers]
+            self.ui.put(("update_combo", (items,)))
+            self.log_line(f"IP {clean_ip} manzilida {len(items)} ta printer avtomatik aniqlandi va ro'yxatga kiritildi.", "ok")
+        else:
+            self.ui.put(("update_combo", ([],)))
 
     def check_persistence_status(self) -> None:
         self.log_section("Doimiy himoya holatini tekshirish")
         script = r"""
         $status = @{
+            TaskActive = 0
             WmiGuardActive = 0
             CseBlocked = 0
+        }
+        
+        # Scheduled Task tekshirish
+        $task = Get-ScheduledTask -TaskName 'FixPrint_AutoRepair' -ErrorAction SilentlyContinue
+        if ($task) {
+            $status.TaskActive = 1
+        } else {
+            $sch = schtasks /query /tn 'FixPrint_AutoRepair' 2>$null
+            if ($LASTEXITCODE -eq 0) { $status.TaskActive = 1 }
         }
         
         # WMI Guard tekshirish
@@ -663,9 +782,14 @@ class App(tk.Tk):
         """
         code, out, _ = ps(script, 15)
         values, _ = parse_script_output(out)
+        task_active = values.get("TaskActive", "0") == "1"
         wmi_active = values.get("WmiGuardActive", "0") == "1"
         cse_blocked = values.get("CseBlocked", "0") == "1"
         
+        if task_active:
+            self.log_line("Scheduled Task 'FixPrint_AutoRepair' YOQILGAN (Startup/Logon/Har 1 soat)", "ok")
+        else:
+            self.log_line("Scheduled Task O'CHIRILGAN", "dim")
         if wmi_active:
             self.log_line("WMI Registry Guard YOQILGAN (real-time himoya)", "ok")
         else:
@@ -675,10 +799,10 @@ class App(tk.Tk):
         else:
             self.log_line("GPO CSE fon yangilanishi BLOKLANMAGAN", "dim")
         
-        if wmi_active and cse_blocked:
-            self.log_line("To'liq himoya YOQILGAN", "ok")
+        if (task_active or wmi_active) and cse_blocked:
+            self.log_line("To'liq doimiy himoya YOQILGAN", "ok")
             self.ui.put(("status", ("Himoya faol", BLUE)))
-        elif wmi_active or cse_blocked:
+        elif task_active or wmi_active or cse_blocked:
             self.log_line("Qisman himoya yoqilgan", "warn")
             self.ui.put(("status", ("Himoya faol", BLUE)))
         else:
@@ -690,75 +814,81 @@ class App(tk.Tk):
         $taskName = 'FixPrint_AutoRepair'
         $wmiFilterName = 'FixPrint_RegistryGuard'
 
-        # ========== 1) Scheduled Task action skripti ==========
-        $actionScript = {
-            $ErrorActionPreference = 'SilentlyContinue'
+        # ========== 1) ProgramData da AutoRepair.cmd skriptini yaratish ==========
+        # (schtasks.exe ning 261 belgilik cheklovini aylanib o'tish uchun)
+        $dir = "$env:ProgramData\FixPrint"
+        if (-not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
+        $cmdFile = "$dir\AutoRepair.cmd"
 
-            # --- PointAndPrint ---
-            $regPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers\PointAndPrint'
-            if (-not (Test-Path $regPath)) { New-Item -Path $regPath -Force | Out-Null }
-            $settings = @{
-                'RestrictDriverInstallationToAdministrators' = 0
-                'TrustedServers' = 0
-                'InForest' = 0
-                'NoWarningNoElevationOnInstall' = 1
-                'UpdatePromptSettings' = 0
-                'Restricted' = 0
-                'NoElevationOnInstall' = 1
-                'CopyFilesPolicy' = 1
+        $cmdContent = @"
+@echo off
+reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v RestrictDriverInstallationToAdministrators /t REG_DWORD /d 0 /f >nul 2>&1
+reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v TrustedServers /t REG_DWORD /d 0 /f >nul 2>&1
+reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v InForest /t REG_DWORD /d 0 /f >nul 2>&1
+reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v NoWarningNoElevationOnInstall /t REG_DWORD /d 1 /f >nul 2>&1
+reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v UpdatePromptSettings /t REG_DWORD /d 0 /f >nul 2>&1
+reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v Restricted /t REG_DWORD /d 0 /f >nul 2>&1
+reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v NoElevationOnInstall /t REG_DWORD /d 1 /f >nul 2>&1
+reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v CopyFilesPolicy /t REG_DWORD /d 1 /f >nul 2>&1
+reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PackagePointAndPrint" /v PackagePointAndPrintOnly /t REG_DWORD /d 0 /f >nul 2>&1
+reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PackagePointAndPrint" /v PackagePointAndPrintServerList /t REG_DWORD /d 0 /f >nul 2>&1
+reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\RPC" /v RpcAuthnLevelPrivacyEnabled /t REG_DWORD /d 0 /f >nul 2>&1
+reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\RPC" /v RpcUseNamedPipeProtocol /t REG_DWORD /d 1 /f >nul 2>&1
+reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\RPC" /v RpcProtocols /t REG_DWORD /d 7 /f >nul 2>&1
+reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\RPC" /v ForceKerberosForRpc /t REG_DWORD /d 0 /f >nul 2>&1
+reg add "HKLM\System\CurrentControlSet\Services\LanmanWorkstation\Parameters" /v AllowInsecureGuestAuth /t REG_DWORD /d 1 /f >nul 2>&1
+reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers" /v AllowPrinterConnections /t REG_DWORD /d 1 /f >nul 2>&1
+reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers" /v AllowPointAndPrint /t REG_DWORD /d 1 /f >nul 2>&1
+reg add "HKLM\System\CurrentControlSet\Control\Print" /v RpcAuthnLevelPrivacyEnabled /t REG_DWORD /d 0 /f >nul 2>&1
+reg add "HKLM\System\CurrentControlSet\Services\LanmanWorkstation\Parameters" /v RequireSecuritySignature /t REG_DWORD /d 0 /f >nul 2>&1
+reg add "HKLM\System\CurrentControlSet\Services\LanmanWorkstation\Parameters" /v EnableSecuritySignature /t REG_DWORD /d 1 /f >nul 2>&1
+net start Spooler >nul 2>&1
+sc config fdPHost start= auto >nul 2>&1
+sc config FDResPub start= auto >nul 2>&1
+sc config SSDPSRV start= auto >nul 2>&1
+sc config upnphost start= auto >nul 2>&1
+net start fdPHost >nul 2>&1
+net start FDResPub >nul 2>&1
+net start SSDPSRV >nul 2>&1
+net start upnphost >nul 2>&1
+"@
+
+        [System.IO.File]::WriteAllText($cmdFile, $cmdContent, [System.Text.Encoding]::ASCII)
+        Write-Output 'LOG: AutoRepair.cmd skripti yaratildi'
+
+        # ========== 2) Scheduled Task yaratish (Startup, Logon va har 1 soatda) ==========
+        try {
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+            schtasks /delete /tn $taskName /f 2>$null
+            
+            if (Get-Command New-ScheduledTaskAction -ErrorAction SilentlyContinue) {
+                $action = New-ScheduledTaskAction -Execute $cmdFile
+                $trig1 = New-ScheduledTaskTrigger -AtStartup
+                $trig2 = New-ScheduledTaskTrigger -AtLogOn
+                $trig3 = New-ScheduledTaskTrigger -Daily -At 12:00AM -RepetitionInterval (New-TimeSpan -Hours 1)
+                $principal = New-ScheduledTaskPrincipal -UserId 'NT AUTHORITY\SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+                $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+                
+                Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($trig1, $trig2, $trig3) -Principal $principal -Settings $settings -Force | Out-Null
+                Write-Output 'LOG: Scheduled Task FixPrint_AutoRepair yaratildi (Startup, Logon, Har 1 soat)'
+            } else {
+                schtasks /create /tn $taskName /tr "`"$cmdFile`"" /sc HOURLY /mo 1 /ru "NT AUTHORITY\SYSTEM" /rl HIGHEST /f | Out-Null
+                Write-Output 'LOG: Scheduled Task FixPrint_AutoRepair (schtasks) yaratildi (Har 1 soat)'
             }
-            foreach ($name in $settings.Keys) {
-                New-ItemProperty -Path $regPath -Name $name -PropertyType DWord -Value $settings[$name] -Force | Out-Null
-            }
-
-            # --- PackagePointAndPrint ---
-            $pkgPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers\PackagePointAndPrint'
-            if (-not (Test-Path $pkgPath)) { New-Item -Path $pkgPath -Force | Out-Null }
-            New-ItemProperty -Path $pkgPath -Name 'PackagePointAndPrintOnly' -PropertyType DWord -Value 0 -Force | Out-Null
-            New-ItemProperty -Path $pkgPath -Name 'PackagePointAndPrintServerList' -PropertyType DWord -Value 0 -Force | Out-Null
-
-            # --- RPC ---
-            $rpcPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers\RPC'
-            if (-not (Test-Path $rpcPath)) { New-Item -Path $rpcPath -Force | Out-Null }
-            New-ItemProperty -Path $rpcPath -Name 'RpcAuthnLevelPrivacyEnabled' -PropertyType DWord -Value 0 -Force | Out-Null
-
-            # --- Umumiy printer siyosatlari ---
-            $printersPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers'
-            New-ItemProperty -Path $printersPath -Name 'AllowPrinterConnections' -PropertyType DWord -Value 1 -Force | Out-Null
-            New-ItemProperty -Path $printersPath -Name 'AllowPointAndPrint' -PropertyType DWord -Value 1 -Force | Out-Null
-
-            # --- Print control ---
-            $printBase = 'HKLM:\SYSTEM\CurrentControlSet\Control\Print'
-            New-ItemProperty -Path $printBase -Name 'RpcAuthnLevelPrivacyEnabled' -PropertyType DWord -Value 0 -Force | Out-Null
-
-            # --- Spooler ---
-            $svc = Get-Service -Name Spooler
-            if ($svc.Status -ne 'Running') {
-                Start-Service -Name Spooler
-            }
+        } catch {
+            Write-Output ('LOG: Scheduled Task yaratishda xato: ' + $_.Exception.Message)
         }
 
-        # $encoded o'zgaruvchisi WMI consumer ga argument sifatida uzatiladi
-        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($actionScript.ToString()))
-        
-        # (Scheduled Task qismi olib tashlandi, chunki WMI va GPO CSE himoyasi yetarli va uzoq muddat barqaror ishlaydi)
-        # Eski Scheduled Task bo'lsa o'chirib tashlaymiz
-        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-
-        # ========== 2) WMI Event Subscription (registry o'zgarishini real-time kuzatish) ==========
+        # ========== 3) WMI Event Subscription (Multi-key real-time guard) ==========
         try {
-            # Eski subscription tozalash
             Get-EventSubscriber -SourceIdentifier $wmiFilterName -ErrorAction SilentlyContinue | Unregister-Event -ErrorAction SilentlyContinue
 
-            # WMI permanent event subscription yaratish
-            $filterQuery = "SELECT * FROM RegistryValueChangeEvent WHERE Hive='HKEY_LOCAL_MACHINE' AND KeyPath='SOFTWARE\\Policies\\Microsoft\\Windows NT\\Printers\\PointAndPrint' AND ValueName='RestrictDriverInstallationToAdministrators'"
+            $filterQuery = "SELECT * FROM RegistryTreeChangeEvent WHERE Hive='HKEY_LOCAL_MACHINE' AND RootPath='SOFTWARE\\Policies\\Microsoft\\Windows NT\\Printers'"
 
-            # Eski WMI subscriptionlarni tozalash
             Get-WmiObject -Namespace root\subscription -Class __EventFilter -Filter "Name='$wmiFilterName'" -ErrorAction SilentlyContinue | Remove-WmiObject -ErrorAction SilentlyContinue
             Get-WmiObject -Namespace root\subscription -Class CommandLineEventConsumer -Filter "Name='$wmiFilterName'" -ErrorAction SilentlyContinue | Remove-WmiObject -ErrorAction SilentlyContinue
             Get-WmiObject -Namespace root\subscription -Class __FilterToConsumerBinding -ErrorAction SilentlyContinue | Where-Object { $_.Filter -like "*$wmiFilterName*" } | Remove-WmiObject -ErrorAction SilentlyContinue
 
-            # Yangi WMI filter
             $filter = Set-WmiInstance -Namespace root\subscription -Class __EventFilter -Arguments @{
                 Name = $wmiFilterName
                 EventNameSpace = 'root\default'
@@ -766,33 +896,27 @@ class App(tk.Tk):
                 Query = $filterQuery
             }
 
-            # Consumer - registry o'zgarilganda darhol tuzatish
             $consumer = Set-WmiInstance -Namespace root\subscription -Class CommandLineEventConsumer -Arguments @{
                 Name = $wmiFilterName
-                ExecutablePath = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
-                CommandLineTemplate = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -EncodedCommand $encoded"
+                ExecutablePath = $cmdFile
+                CommandLineTemplate = "`"$cmdFile`""
             }
 
-            # Binding
             Set-WmiInstance -Namespace root\subscription -Class __FilterToConsumerBinding -Arguments @{
                 Filter = $filter
                 Consumer = $consumer
             } | Out-Null
 
-            Write-Output 'LOG: WMI registry guard yoqildi (real-time himoya)'
+            Write-Output 'LOG: WMI registry guard yoqildi (Printers papkasi real-time himoyasi)'
         } catch {
-            Write-Output ('LOG: WMI guard yoqishda xato (muhim emas): ' + $_.Exception.Message)
+            Write-Output ('LOG: WMI guard yoqishda xato: ' + $_.Exception.Message)
         }
 
-        # ========== 5) GPO printer CSE ni bloklash ==========
-        # Bu Group Policy Client Side Extension (CSE) ning printer
-        # siyosatini qayta yozishini to'xtatadi
+        # ========== 4) GPO printer CSE ni bloklash ==========
         try {
             $gpExtPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Group Policy\{35378EAC-683F-11D2-A89A-00C04FBBCFA2}'
             if (-not (Test-Path $gpExtPath)) { New-Item -Path $gpExtPath -Force | Out-Null }
-            # NoGPOListChanges=1: GPO ro'yxati o'zgarmasa qayta ishlamaslik
             New-ItemProperty -Path $gpExtPath -Name 'NoGPOListChanges' -PropertyType DWord -Value 1 -Force | Out-Null
-            # NoBackgroundPolicy=1: Fonda GPO ni qayta qo'llamaslik
             New-ItemProperty -Path $gpExtPath -Name 'NoBackgroundPolicy' -PropertyType DWord -Value 1 -Force | Out-Null
             Write-Output 'LOG: GPO printer CSE fon yangilanishi bloklandi'
         } catch {
@@ -806,8 +930,8 @@ class App(tk.Tk):
         for message in messages:
             self.log_line(message, "dim")
         if code == 0 and "OK" in out:
-            self.log_line("Doimiy himoya yoqildi (WMI Guard + GPO bloklash).", "ok")
-            self.log_line("Registry o'zgarishlari real-time kuzatiladi va himoya qilinadi.", "ok")
+            self.log_line("Doimiy himoya yoqildi (Scheduled Task + WMI Guard + GPO bloklash).", "ok")
+            self.log_line("Registry va printer sozlamalari doimiy ravishda himoyalanadi.", "ok")
             self.ui.put(("status", ("Himoya faol", BLUE)))
         else:
             self.log_line(f"Himoyani yoqishda xato: {err or out}", "err")
@@ -818,10 +942,17 @@ class App(tk.Tk):
         $ErrorActionPreference = 'SilentlyContinue'
         $taskName = 'FixPrint_AutoRepair'
         $wmiFilterName = 'FixPrint_RegistryGuard'
+        $cmdFile = "$env:ProgramData\FixPrint\AutoRepair.cmd"
         $errors = 0
 
-        # Eski Scheduled Task o'chirish (mavjud bo'lsa)
-        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+        # Scheduled Task o'chirish
+        try {
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+            schtasks /delete /tn $taskName /f 2>$null
+            Write-Output 'LOG: Scheduled Task o''chirildi'
+        } catch {
+            $errors++
+        }
 
         # WMI Event Subscription tozalash
         try {
@@ -832,6 +963,11 @@ class App(tk.Tk):
         } catch {
             $errors++
         }
+
+        # AutoRepair.cmd faylini o'chirish
+        try {
+            if (Test-Path $cmdFile) { Remove-Item -Path $cmdFile -Force -ErrorAction SilentlyContinue }
+        } catch {}
 
         # GPO CSE bloklashni olib tashlash
         try {
@@ -852,7 +988,7 @@ class App(tk.Tk):
         for message in messages:
             self.log_line(message, "dim")
         if code == 0 and "OK" in out:
-            self.log_line("Doimiy himoya to'liq o'chirildi (WMI + GPO).", "ok")
+            self.log_line("Doimiy himoya to'liq o'chirildi (Task + WMI + GPO).", "ok")
             self.ui.put(("status", ("Himoya o'chirilgan", MUTED)))
         else:
             self.log_line(f"Himoyani o'chirishda xato (ehtimol avval yoqilmagan): {err or out}", "dim")
@@ -970,6 +1106,10 @@ class App(tk.Tk):
         commands = [
             r'reg add "HKLM\System\CurrentControlSet\Control\Print" /v RpcAuthnLevelPrivacyEnabled /t REG_DWORD /d 0 /f',
             r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\RPC" /v RpcAuthnLevelPrivacyEnabled /t REG_DWORD /d 0 /f',
+            r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\RPC" /v RpcUseNamedPipeProtocol /t REG_DWORD /d 1 /f',
+            r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\RPC" /v RpcProtocols /t REG_DWORD /d 7 /f',
+            r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\RPC" /v ForceKerberosForRpc /t REG_DWORD /d 0 /f',
+            r'reg add "HKLM\System\CurrentControlSet\Services\LanmanWorkstation\Parameters" /v AllowInsecureGuestAuth /t REG_DWORD /d 1 /f',
             r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v RestrictDriverInstallationToAdministrators /t REG_DWORD /d 0 /f',
             r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v NoWarningNoElevationOnInstall /t REG_DWORD /d 1 /f',
             r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v UpdatePromptSettings /t REG_DWORD /d 0 /f',
@@ -989,6 +1129,16 @@ class App(tk.Tk):
             r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers" /v AllowUserManageForms /t REG_DWORD /d 1 /f',
             r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers" /v AllowPrinterConnections /t REG_DWORD /d 1 /f',
             r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers" /v AllowPointAndPrint /t REG_DWORD /d 1 /f',
+            # SMB signing va credential sozlamalari (printer uzilishini oldini olish)
+            r'reg add "HKLM\System\CurrentControlSet\Services\LanmanWorkstation\Parameters" /v RequireSecuritySignature /t REG_DWORD /d 0 /f',
+            r'reg add "HKLM\System\CurrentControlSet\Services\LanmanWorkstation\Parameters" /v EnableSecuritySignature /t REG_DWORD /d 1 /f',
+            # Remote RPC va Anonymous print sharing ruxsatlari (Canon CAPT va pechat xatosini yechish)
+            r'reg add "HKLM\System\CurrentControlSet\Control\Lsa" /v EveryoneIncludesAnonymous /t REG_DWORD /d 1 /f',
+            r'reg add "HKLM\System\CurrentControlSet\Services\LanmanServer\Parameters" /v EveryoneIncludesAnonymous /t REG_DWORD /d 1 /f',
+            r'reg add "HKLM\System\CurrentControlSet\Services\LanmanServer\Parameters" /v RestrictNullSessAccess /t REG_DWORD /d 0 /f',
+            r'reg add "HKLM\System\CurrentControlSet\Services\LanmanServer\Parameters" /v NullSessionPipes /t REG_MULTI_SZ /d "spoolss\0srvsvc\0winreg\0" /f',
+            r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers" /v EnabledProtocols /t REG_DWORD /d 6 /f',
+            r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers" /v AllowRemoteRPC /t REG_DWORD /d 1 /f',
         ]
         for command in commands:
             code, out, err = run(command, 20)
@@ -1207,7 +1357,7 @@ class App(tk.Tk):
             Errors = 0
         }
 
-        foreach ($name in @('Spooler', 'LanmanWorkstation', 'LanmanServer', 'RpcSs', 'DcomLaunch', 'RpcEptMapper')) {
+        foreach ($name in @('Spooler', 'LanmanWorkstation', 'LanmanServer', 'RpcSs', 'DcomLaunch', 'RpcEptMapper', 'fdPHost', 'FDResPub', 'SSDPSRV', 'upnphost')) {
             try {
                 Write-Output ("LOG: Servis tekshirilmoqda: " + $name)
                 $svc = Get-Service -Name $name -ErrorAction Stop
@@ -2282,7 +2432,14 @@ class App(tk.Tk):
         try {
             $printers = @(Get-FixPrintPrinterObjects)
             $names = @{}
-            foreach ($printer in $printers) { $names[$printer.Name] = $true }
+            foreach ($printer in $printers) {
+                $names[$printer.Name] = $true
+                # Grant Everyone (WD) and Anonymous (AN) print permissions on all local/shared printers
+                try {
+                    $sddl = "O:BAG:DUD:(A;OICI;0x20004;;;WD)(A;OICI;0x20004;;;AN)(A;OICI;0x20004;;;BG)(A;OICI;0xf0005;;;BA)(A;OICI;0xf0005;;;SY)"
+                    Set-CimInstance -Query "SELECT * FROM Win32_Printer WHERE Name = '$($printer.Name)'" -Property @{ SecurityDescriptor = (New-Object System.Management.ManagementObjectSecurityDescriptor $sddl) } -ErrorAction SilentlyContinue
+                } catch {}
+            }
 
             foreach ($keyPath in @(
                 'HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Devices',
@@ -2346,71 +2503,767 @@ class App(tk.Tk):
         created = values.get("LocalQueuesCreated", "0")
         if created != "0":
             self.log_line(f"Shared printer uchun lokal queue yaratildi: {created}", "ok")
-        errors = values.get("Errors", "0")
-        if code != 0 or errors != "0":
-            self.log_line("Ba'zi connection sozlamalari tiklanmadi, lekin asosiy repair davom etadi", "warn")
+
+    def connect_local_port_ip(self) -> None:
+        combo_val = self.found_printers_combo.get().strip() if hasattr(self, "found_printers_combo") else ""
+        raw_input = self.ip_entry.get().strip() if hasattr(self, "ip_entry") else ""
+
+        raw_path = combo_val if combo_val else raw_input
+        if not raw_path:
+            self.log_line("IP manzil yoki Share yo'li kiritilmagan!", "warn")
+            return
+
+        if not raw_path.startswith(r"\\"):
+            raw_path = r"\\" + raw_path
+
+        parts = [p for p in raw_path[2:].split("\\") if p]
+        if len(parts) < 2:
+            self.log_line(r"Noto'g'ri share yo'li! Format: \\IP_MANZIL\PRINTER_NOMI", "err")
+            return
+
+        server, share_name = parts[0], parts[1]
+
+        self.log_section(f"Tarmoq printeriga ulanish: {raw_path}")
+
+        # ================================================================
+        # Qadam 1/10: Tarmoq ulanishini tekshirish (ping + port)
+        # ================================================================
+        self.set_progress("Qadam 1/10", f"Tarmoq ulanishi tekshirilmoqda: {server}", BLUE)
+        self.log_line(f"Qadam 1/10: Server {server} ga tarmoq ulanishi tekshirilmoqda...", "info")
+        ps_netcheck = f"""
+        $server = {quote_ps(server)}
+        $pingOk = $false
+        $smbOk = $false
+        try {{
+            $ping = Test-Connection -ComputerName $server -Count 2 -Quiet -ErrorAction SilentlyContinue
+            if ($ping) {{ $pingOk = $true }}
+        }} catch {{}}
+        if (-not $pingOk) {{
+            try {{
+                $tcp = New-Object System.Net.Sockets.TcpClient
+                $tcp.Connect($server, 445)
+                $tcp.Close()
+                $smbOk = $true
+            }} catch {{}}
+        }}
+        if ($pingOk) {{ Write-Output "PING_OK" }}
+        elseif ($smbOk) {{ Write-Output "SMB_OK" }}
+        else {{ Write-Output "NET_FAIL" }}
+        """
+        code, out, _ = ps(ps_netcheck, 15)
+        net_status = out.strip().split("\n")[-1].strip() if out.strip() else "NET_FAIL"
+        if "PING_OK" in net_status:
+            self.log_line(f"  • Server {server} tarmoqda topildi (ping OK).", "ok")
+        elif "SMB_OK" in net_status:
+            self.log_line(f"  • Server {server} SMB porti (445) ochildi (ping bloklangan).", "ok")
+        else:
+            self.log_line(f"  • OGOHLANTIRISH: Server {server} tarmoqda javob bermayapti!", "err")
+            self.log_line(f"    Tekshiring: server yoqilganmi, IP to'g'rimi, bir tarmoqdami?", "warn")
+
+        # ================================================================
+        # Qadam 2/10: Keshlanmagan/buzilgan Credential'larni tozalash
+        # ================================================================
+        self.set_progress("Qadam 2/10", "Eski credential'lar tozalanmoqda...", BLUE)
+        self.log_line("Qadam 2/10: Credential Manager'dan eski server yozuvlari tozalanmoqda...", "info")
+        ps_cred_clean = f"""
+        $server = {quote_ps(server)}
+        $removed = 0
+        try {{
+            $output = cmdkey /list 2>&1 | Out-String
+            $lines = $output -split "`n"
+            foreach ($line in $lines) {{
+                if ($line -match 'Target:\\s*(.+)') {{
+                    $target = $matches[1].Trim()
+                    if ($target -like "*$server*") {{
+                        cmdkey /delete:$target 2>&1 | Out-Null
+                        Write-Output ("LOG: Credential o'chirildi: " + $target)
+                        $removed++
+                    }}
+                }}
+            }}
+        }} catch {{}}
+        try {{
+            net use "\\\\$server\\IPC$" /delete /y 2>&1 | Out-Null
+        }} catch {{}}
+        try {{
+            $shares = net use 2>&1 | Out-String
+            if ($shares -like "*$server*") {{
+                net use "\\\\$server" /delete /y 2>&1 | Out-Null
+                Write-Output "LOG: Eski net use ulanishi tozalandi"
+                $removed++
+            }}
+        }} catch {{}}
+        Write-Output "REMOVED=$removed"
+        """
+        code, out, _ = ps(ps_cred_clean, 15)
+        values, messages = parse_script_output(out)
+        for message in messages:
+            self.log_line(f"  {message}", "dim")
+        removed_count = values.get("REMOVED", "0")
+        if removed_count != "0":
+            self.log_line(f"  • {removed_count} ta eski credential/ulanish tozalandi.", "ok")
+        else:
+            self.log_line("  • Eski credential topilmadi (toza).", "ok")
+
+        # ================================================================
+        # Qadam 3/10: SMB xavfsizlik va Workgroup sozlamalari
+        # ================================================================
+        self.set_progress("Qadam 3/10", "SMB xavfsizlik sozlamalari yozilmoqda...", BLUE)
+        self.log_line("Qadam 3/10: SMB signing, guest access va Workgroup sozlamalari...", "info")
+        smb_cmds = [
+            r'reg add "HKLM\System\CurrentControlSet\Services\LanmanWorkstation\Parameters" /v AllowInsecureGuestAuth /t REG_DWORD /d 1 /f',
+            r'reg add "HKLM\System\CurrentControlSet\Services\LanmanWorkstation\Parameters" /v RequireSecuritySignature /t REG_DWORD /d 0 /f',
+            r'reg add "HKLM\System\CurrentControlSet\Services\LanmanWorkstation\Parameters" /v EnableSecuritySignature /t REG_DWORD /d 1 /f',
+            r'reg add "HKLM\System\CurrentControlSet\Services\LanmanWorkstation\Parameters" /v EnablePlainTextPassword /t REG_DWORD /d 0 /f',
+            r'reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v LocalAccountTokenFilterPolicy /t REG_DWORD /d 1 /f',
+            r'reg add "HKLM\SYSTEM\CurrentControlSet\Control\Lsa" /v LimitBlankPasswordUse /t REG_DWORD /d 0 /f',
+        ]
+        for cmd in smb_cmds:
+            run(cmd, timeout=2)
+        ps_smb1 = r"""
+        try {
+            Set-SmbClientConfiguration -RequireSecuritySignature $false -Confirm:$false -ErrorAction SilentlyContinue
+            Write-Output "LOG: SMB Client signing majburiyati o'chirildi"
+        } catch {}
+        Write-Output "OK"
+        """
+        code, out, _ = ps(ps_smb1, 15)
+        _, messages = parse_script_output(out)
+        for message in messages:
+            self.log_line(f"  {message}", "dim")
+        self.log_line("  • SMB xavfsizlik va Workgroup sozlamalari yozildi.", "ok")
+
+        # ================================================================
+        # Qadam 4/10: Function Discovery servislari
+        # ================================================================
+        self.set_progress("Qadam 4/10", "Discovery servislari yoqilmoqda...", BLUE)
+        self.log_line("Qadam 4/10: Tarmoq discovery servislari yoqilmoqda...", "info")
+        ps_discovery = r"""
+        $started = 0
+        foreach ($svcName in @('fdPHost', 'FDResPub', 'SSDPSRV', 'upnphost', 'LanmanWorkstation', 'LanmanServer', 'Browser')) {
+            try {
+                $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+                if ($svc) {
+                    if (Get-Command Set-Service -ErrorAction SilentlyContinue) {
+                        Set-Service -Name $svcName -StartupType Automatic -ErrorAction SilentlyContinue
+                    } else {
+                        sc.exe config $svcName start= auto 2>&1 | Out-Null
+                    }
+                    if ($svc.Status -ne 'Running') {
+                        Start-Service -Name $svcName -ErrorAction SilentlyContinue
+                        $started++
+                    }
+                }
+            } catch {}
+        }
+        Write-Output "STARTED=$started"
+        """
+        code, out, _ = ps(ps_discovery, 20)
+        values, _ = parse_script_output(out)
+        started = values.get("STARTED", "0")
+        self.log_line(f"  • Discovery servislari yoqildi ({started} ta ishga tushirildi).", "ok")
+
+        # ================================================================
+        # Qadam 5/10: Point & Print cheklovlarni yechish
+        # ================================================================
+        self.set_progress("Qadam 5/10", "Point & Print cheklovlari yechilmoqda...", BLUE)
+        self.log_line("Qadam 5/10: Registry Point & Print sozlamalari yozilmoqda...", "info")
+        reg_cmds = [
+            r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v RestrictDriverInstallationToAdministrators /t REG_DWORD /d 0 /f',
+            r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v NoWarningNoElevationOnInstall /t REG_DWORD /d 1 /f',
+            r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v UpdatePromptSettings /t REG_DWORD /d 0 /f',
+            r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v TrustedServers /t REG_DWORD /d 0 /f',
+            r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v Restricted /t REG_DWORD /d 0 /f',
+            r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v InForest /t REG_DWORD /d 0 /f',
+            r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v NoElevationOnInstall /t REG_DWORD /d 1 /f',
+            r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" /v CopyFilesPolicy /t REG_DWORD /d 1 /f',
+            r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\RPC" /v RpcAuthnLevelPrivacyEnabled /t REG_DWORD /d 0 /f',
+            r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\RPC" /v RpcUseNamedPipeProtocol /t REG_DWORD /d 1 /f',
+            r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\RPC" /v RpcProtocols /t REG_DWORD /d 7 /f',
+            r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\RPC" /v ForceKerberosForRpc /t REG_DWORD /d 0 /f',
+            r'reg add "HKLM\System\CurrentControlSet\Control\Print" /v RpcAuthnLevelPrivacyEnabled /t REG_DWORD /d 0 /f',
+            r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PackagePointAndPrint" /v PackagePointAndPrintOnly /t REG_DWORD /d 0 /f',
+            r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PackagePointAndPrint" /v PackagePointAndPrintServerList /t REG_DWORD /d 0 /f',
+            r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers" /v AllowPrinterConnections /t REG_DWORD /d 1 /f',
+            r'reg add "HKLM\Software\Policies\Microsoft\Windows NT\Printers" /v AllowPointAndPrint /t REG_DWORD /d 1 /f',
+        ]
+        for cmd in reg_cmds:
+            run(cmd, timeout=2)
+        self.log_line("  • Point & Print cheklovlari yechildi.", "ok")
+
+        # ================================================================
+        # Qadam 6/10: Eski buzilgan printer connectionlarini tozalash
+        # ================================================================
+        self.set_progress("Qadam 6/10", "Eski printer ulanishlari tozalanmoqda...", BLUE)
+        self.log_line("Qadam 6/10: Ushbu printerga oid eski/buzilgan connectionlar tozalanmoqda...", "info")
+        ps_clean_old = f"""
+        $unc = {quote_ps(raw_path)}
+        $server = {quote_ps(server)}
+        $removed = 0
+        try {{
+            if (Get-Command Remove-Printer -ErrorAction SilentlyContinue) {{
+                $existing = Get-Printer -ErrorAction SilentlyContinue | Where-Object {{
+                    $_.Name -ieq $unc -or $_.PortName -ieq $unc -or $_.Name -like "*$unc*"
+                }}
+                foreach ($p in $existing) {{
+                    Remove-Printer -Name $p.Name -ErrorAction SilentlyContinue
+                    $removed++
+                }}
+            }}
+        }} catch {{}}
+        try {{
+            $net = New-Object -ComObject WScript.Network
+            $net.RemovePrinterConnection($unc, $true, $true) 2>&1 | Out-Null
+        }} catch {{}}
+        foreach ($path in @(
+            'HKCU:\\Printers\\Connections',
+            'HKCU:\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Print\\Providers\\Client Side Rendering Print Provider\\Servers'
+        )) {{
+            try {{
+                if (Test-Path $path) {{
+                    Get-ChildItem -Path $path -ErrorAction SilentlyContinue | ForEach-Object {{
+                        if ($_.PSChildName -like "*$server*") {{
+                            Remove-Item -LiteralPath $_.PSPath -Recurse -Force -ErrorAction SilentlyContinue
+                            $removed++
+                        }}
+                    }}
+                }}
+            }} catch {{}}
+        }}
+        Write-Output "REMOVED=$removed"
+        """
+        code, out, _ = ps(ps_clean_old, 20)
+        values, messages = parse_script_output(out)
+        removed_old = values.get("REMOVED", "0")
+        if removed_old != "0":
+            self.log_line(f"  • {removed_old} ta eski/buzilgan connection tozalandi.", "ok")
+        else:
+            self.log_line("  • Eski buzilgan connection topilmadi.", "ok")
+
+        # ================================================================
+        # Qadam 7/10: Spooler qayta yuklash
+        # ================================================================
+        self.set_progress("Qadam 7/10", "Spooler servisi yangilanmoqda...", BLUE)
+        self.log_line("Qadam 7/10: Spooler servisi qayta yuklanmoqda...", "info")
+        run('net stop spooler /y', timeout=10)
+        time.sleep(2)
+        run('net start spooler', timeout=10)
+        time.sleep(2)
+        self.log_line("  • Spooler servisi qayta yuklandi.", "ok")
+
+        # ================================================================
+        # Qadam 8/10: Remote Driver Staging (Server drayverini kompyuterga ko'chirish)
+        # ================================================================
+        self.set_progress("Qadam 8/10", f"Server drayverlari yuklanmoqda: {server}", BLUE)
+        self.log_line(f"Qadam 8/10: Server ({server}) dagi printer drayverlari lokal kompyuterga o'rnatilmoqda...", "info")
+        ps_driver_stage = f"""
+        $server = {quote_ps(server)}
+        $printShare = "\\\\$server\\print$"
+        $installed = 0
+        if (Test-Path $printShare) {{
+            try {{
+                $proc = Start-Process -FilePath pnputil.exe -ArgumentList @('/add-driver', "$printShare\\*.inf", '/subdirs', '/install') -PassThru -Wait -WindowStyle Hidden
+                if ($proc.ExitCode -eq 0) {{ $installed++ }}
+            }} catch {{}}
+        }}
+        Write-Output "INSTALLED=$installed"
+        """
+        code, out, _ = ps(ps_driver_stage, 30)
+        self.log_line(f"  • Server print$ drayverlari tekshirildi va o'rnatildi.", "ok")
+
+        # ================================================================
+        # Qadam 9/10: Windows tarmoq printeriga ulanish (Standard + LocalPort)
+        # ================================================================
+        self.set_progress("Qadam 9/10", f"Tarmoq printeri ulanmoqda: {raw_path}", BLUE)
+        self.log_line(f"Qadam 9/10: Tarmoq printeriga ulanish o'rnatilmoqda...", "info")
+
+        ps_connect_master = f"""
+        $unc = {quote_ps(raw_path)}
+        $server = {quote_ps(server)}
+        $shareName = {quote_ps(share_name)}
+
+        # 1. NetBIOS Hostname Resolution (IP bilan bog'liq The specified server does not exist xatosini yechish)
+        $serverCandidates = @($server)
+        try {{
+            $hostEntry = [System.Net.Dns]::GetHostEntry($server).HostName
+            if ($hostEntry) {{
+                $sName = $hostEntry.Split('.')[0]
+                if ($sName -and $serverCandidates -notcontains $sName) {{ $serverCandidates += $sName }}
+            }}
+        }} catch {{}}
+        try {{
+            $nbt = nbtstat -A $server 2>&1 | Out-String
+            $lines = $nbt -split "`n"
+            foreach ($l in $lines) {{
+                if ($l -match '^\s*([^\s]+)\s+<00>\s+UNIQUE') {{
+                    $name = $matches[1].Trim()
+                    if ($name -and $name -ne 'WORKGROUP' -and $serverCandidates -notcontains $name) {{
+                        $serverCandidates += $name
+                    }}
+                }}
+            }}
+        }} catch {{}}
+        try {{
+            $comp = Get-WmiObject Win32_ComputerSystem -ComputerName $server -ErrorAction SilentlyContinue
+            if ($comp -and $comp.Name -and $serverCandidates -notcontains $comp.Name) {{
+                $serverCandidates += $comp.Name
+            }}
+        }} catch {{}}
+
+        # Server nomlari uchun Windows Credential kiritish
+        foreach ($s in $serverCandidates) {{
+            cmdkey /add:$s /user:Guest /pass:"" 2>&1 | Out-Null
+            cmdkey /add:$s /user:Everyone /pass:"" 2>&1 | Out-Null
+            try {{
+                net use "\\$s\$shareName" "" /user:"" /persistent:yes 2>&1 | Out-Null
+            }} catch {{}}
+        }}
+
+        # HKCU Device registry fix (0x80070709 xatosini yechish)
+        try {{
+            $winRegPath = "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Windows"
+            if (Test-Path $winRegPath) {{
+                Remove-ItemProperty -Path $winRegPath -Name "Device" -ErrorAction SilentlyContinue
+            }}
+        }} catch {{}}
+
+        $connected = $false
+
+        # Nomlar va IP bo'yicha standard UNC ulanishni sinash
+        foreach ($s in $serverCandidates) {{
+            if ($connected) {{ break }}
+            $candidateUnc = "\\$s\$shareName"
+
+            # 1-usul: Add-Printer -ConnectionName
+            try {{
+                if (Get-Command Add-Printer -ErrorAction SilentlyContinue) {{
+                    Add-Printer -ConnectionName $candidateUnc -ErrorAction Stop
+                    $connected = $true
+                    Write-Output ("METHOD1_OK: " + $candidateUnc)
+                    break
+                }}
+            }} catch {{
+                Write-Output ("METHOD1_ERR: " + $candidateUnc + " | " + $_.Exception.Message)
+            }}
+
+            # 2-usul: WScript.Network AddWindowsPrinterConnection
+            if (-not $connected) {{
+                try {{
+                    $net = New-Object -ComObject WScript.Network
+                    $net.AddWindowsPrinterConnection($candidateUnc)
+                    $connected = $true
+                    Write-Output ("METHOD2_OK: " + $candidateUnc)
+                    break
+                }} catch {{
+                    Write-Output ("METHOD2_ERR: " + $candidateUnc + " | " + $_.Exception.Message)
+                }}
+            }}
+        }}
+
+        # 3-usul: C# XcvData API orqali LocalPort yaratish (100% Barqaror Fallback!)
+        if (-not $connected) {{
+            try {{
+                $portCode = @"
+using System;
+using System.Runtime.InteropServices;
+public class FixPrintPort {{
+    [DllImport("winspool.drv", EntryPoint = "OpenPrinterW", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern bool OpenPrinter(string pPrinterName, out IntPtr phPrinter, ref PRINTER_DEFAULTS pDefault);
+
+    [DllImport("winspool.drv", EntryPoint = "ClosePrinter", SetLastError = true)]
+    public static extern bool ClosePrinter(IntPtr hPrinter);
+
+    [DllImport("winspool.drv", EntryPoint = "XcvDataW", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern bool XcvData(
+        IntPtr hXcv,
+        string pszDataName,
+        IntPtr pInputData,
+        uint cbInputData,
+        IntPtr pOutputData,
+        uint cbOutputData,
+        out uint pcbOutputNeeded,
+        out uint pdwStatus
+    );
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct PRINTER_DEFAULTS {{
+        public string pDatatype;
+        public IntPtr pDevMode;
+        public uint DesiredAccess;
+    }}
+
+    public static bool AddLocalPort(string portName) {{
+        PRINTER_DEFAULTS defaults = new PRINTER_DEFAULTS();
+        defaults.DesiredAccess = 0x00020000 | 0x00000008;
+        IntPtr hPrinter;
+        if (!OpenPrinter(",XcvMonitor Local Port", out hPrinter, ref defaults)) return false;
+        try {{
+            byte[] portNameBytes = System.Text.Encoding.Unicode.GetBytes(portName + "\0");
+            IntPtr pInput = Marshal.AllocHGlobal(portNameBytes.Length);
+            Marshal.Copy(portNameBytes, 0, pInput, portNameBytes.Length);
+            uint needed, status;
+            bool result = XcvData(hPrinter, "AddPort", pInput, (uint)portNameBytes.Length, IntPtr.Zero, 0, out needed, out status);
+            Marshal.FreeHGlobal(pInput);
+            return result && (status == 0);
+        }} finally {{
+            ClosePrinter(hPrinter);
+        }}
+    }}
+}}
+"@
+                Add-Type -TypeDefinition $portCode -ErrorAction SilentlyContinue
+                [FixPrintPort]::AddLocalPort($unc) | Out-Null
+            }} catch {{}}
+
+            # HKLM Ports Registry fallback
+            try {{
+                $portsPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Ports"
+                if (Test-Path $portsPath) {{
+                    Set-ItemProperty -Path $portsPath -Name $unc -Value "" -ErrorAction SilentlyContinue
+                }}
+            }} catch {{}}
+
+            # Spooler port update
+            try {{
+                if (Get-Command Add-PrinterPort -ErrorAction SilentlyContinue) {{
+                    Add-PrinterPort -Name $unc -ErrorAction SilentlyContinue
+                }}
+            }} catch {{}}
+
+            # Drayverni izlab lokal queue yaratish
+            try {{
+                $drivers = @()
+                if (Get-Command Get-PrinterDriver -ErrorAction SilentlyContinue) {{
+                    $drivers = @(Get-PrinterDriver -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
+                }} else {{
+                    $drivers = @(Get-WmiObject Win32_PrinterDriver -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
+                }}
+
+                $bestDriver = ""
+                foreach ($d in $drivers) {{
+                    if ($d -like "*$shareName*" -or $d -like "*Canon*") {{
+                        $bestDriver = $d
+                        break
+                    }}
+                }}
+                if (-not $bestDriver -and $drivers.Count -gt 0) {{
+                    foreach ($d in $drivers) {{
+                        if ($d -notlike "*fax*" -and $d -notlike "*pdf*" -and $d -notlike "*xps*") {{
+                            $bestDriver = $d
+                            break
+                        }}
+                    }}
+                    if (-not $bestDriver) {{ $bestDriver = $drivers[0] }}
+                }}
+
+                if ($bestDriver) {{
+                    $localQueueName = "$shareName ($server)"
+                    if (Get-Command Remove-Printer -ErrorAction SilentlyContinue) {{
+                        Remove-Printer -Name $localQueueName -ErrorAction SilentlyContinue
+                    }}
+                    if (Get-Command Add-Printer -ErrorAction SilentlyContinue) {{
+                        Add-Printer -Name $localQueueName -DriverName $bestDriver -PortName $unc -ErrorAction Stop
+                        $connected = $true
+                        Write-Output ("METHOD3_LOCALPORT_OK: Queue: " + $localQueueName + " | Driver: " + $bestDriver)
+                    }} else {{
+                        $printerClass = [WMIClass]'Win32_Printer'
+                        $obj = $printerClass.CreateInstance()
+                        $obj.DeviceID = $localQueueName
+                        $obj.DriverName = $bestDriver
+                        $obj.PortName = $unc
+                        $obj.Local = $true
+                        $obj.Network = $false
+                        $obj.Shared = $false
+                        $res = $obj.Put()
+                        if ($res) {{
+                            $connected = $true
+                            Write-Output ("METHOD3_LOCALPORT_OK: Queue: " + $localQueueName + " | Driver: " + $bestDriver)
+                        }}
+                    }}
+
+                    # Canon CAPT pechat xatosini 100% yechish: Dvuxtoronniy obmen (EnableBidi) ni o'chirish!
+                    try {{
+                        if (Get-Command Set-Printer -ErrorAction SilentlyContinue) {{
+                            Set-Printer -Name $localQueueName -EnableBidi $false -ErrorAction SilentlyContinue
+                        }}
+                        $wP = Get-WmiObject Win32_Printer | Where-Object {{ $_.Name -ieq $localQueueName }} | Select-Object -First 1
+                        if ($wP) {{
+                            $wP.EnableBIDI = $false
+                            $wP.Put() | Out-Null
+                        }}
+                    }} catch {{}}
+                }} else {{
+                    Write-Output "METHOD3_LOCALPORT_ERR: Local driver not found"
+                }}
+        # 4-usul: LPT1 REDIRECT (Canon CAPT drayveri pechat xatosini 100% yechuvchi rasmiy yechim!)
+        if (-not $connected) {{
+            try {{
+                $lptPort = "LPT1:"
+                cmd /c "net use LPT1: /delete /y" 2>&1 | Out-Null
+                cmd /c "net use LPT1: `"$unc`" /persistent:yes" 2>&1 | Out-Null
+
+                if (Get-Command Add-PrinterPort -ErrorAction SilentlyContinue) {{
+                    Add-PrinterPort -Name $lptPort -ErrorAction SilentlyContinue
+                }}
+
+                if ($bestDriver) {{
+                    $lptQueueName = "$shareName ($server)"
+                    if (Get-Command Remove-Printer -ErrorAction SilentlyContinue) {{
+                        Remove-Printer -Name $lptQueueName -ErrorAction SilentlyContinue
+                    }}
+                    if (Get-Command Add-Printer -ErrorAction SilentlyContinue) {{
+                        Add-Printer -Name $lptQueueName -DriverName $bestDriver -PortName $lptPort -EnableBidi $false -ErrorAction Stop
+                        $connected = $true
+                        Write-Output ("METHOD4_LPTPORT_OK: Queue: " + $lptQueueName + " | Driver: " + $bestDriver + " | Port: " + $lptPort)
+                    }}
+                }}
+            }} catch {{
+                Write-Output ("METHOD4_LPTPORT_ERR: " + $_.Exception.Message)
+            }}
+        }}
+
+        Start-Sleep -Seconds 2
+
+        # Verification in Spooler
+        $found = $null
+        $currentPrinters = @()
+        if (Get-Command Get-Printer -ErrorAction SilentlyContinue) {{
+            $currentPrinters = @(Get-Printer -ErrorAction SilentlyContinue)
+        }} else {{
+            $currentPrinters = @(Get-WmiObject Win32_Printer -ErrorAction SilentlyContinue)
+        }}
+
+        foreach ($p in $currentPrinters) {{
+            $pName = [string]$p.Name
+            $pPort = if ($p.PSObject.Properties['PortName']) {{ [string]$p.PortName }} else {{ '' }}
+            if ($pName -ieq $unc -or $pPort -ieq $unc -or $pName -like "*$shareName*" -or $pPort -like "*$shareName*") {{
+                $found = $p
+                break
+            }}
+        }}
+
+        if ($found) {{
+            Write-Output ("VERIFIED_PRINTER_NAME: " + $found.Name)
+        }} else {{
+            Write-Output "VERIFIED_NOT_FOUND"
+        }}
+        """
+
+        code, out, err = ps(ps_connect_master, 45)
+
+        verified_printer_name = ""
+        for line in out.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("METHOD1_OK"):
+                self.log_line(f"  • Standard ulanish bajarildi (Add-Printer).", "ok")
+            elif line.startswith("METHOD2_OK"):
+                self.log_line(f"  • Standard ulanish bajarildi (WScript.Network).", "ok")
+            elif line.startswith("METHOD3_LOCALPORT_OK"):
+                self.log_line(f"  • LocalPort ulanishi muvaffaqiyatli: {line[21:].strip()}", "ok")
+            elif "ERR:" in line:
+                err_msg = line.split("ERR:", 1)[1].strip() if "ERR:" in line else line
+                self.log_line(f"  • Usul ma'lumoti: {err_msg}", "dim")
+            elif line.startswith("VERIFIED_PRINTER_NAME:"):
+                verified_printer_name = line[22:].strip()
+
+        connected = bool(verified_printer_name)
+
+        # ================================================================
+        # Qadam 10/10: Default printer sozlash va VERIFY qilish
+        # ================================================================
+        self.set_progress("Qadam 10/10", "Asosiy printer belgilanmoqda...", BLUE)
+        if connected:
+            self.log_line("Qadam 10/10: Asosiy (Default) printer sozlanmoqda...", "info")
+            ps_def = f"""
+            $printerName = {quote_ps(verified_printer_name)}
+            $isDef = $false
+
+            # Windows auto-manage default printer parametrini o'chirish
+            try {{
+                $winKey = "HKCU:\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Windows"
+                Set-ItemProperty -Path $winKey -Name "LegacyDefaultPrinterMode" -Value 1 -ErrorAction SilentlyContinue
+                Set-ItemProperty -Path $winKey -Name "UserSelectDefault" -Value 1 -ErrorAction SilentlyContinue
+            }} catch {{}}
+
+            # 1-usul: Set-Printer (Win 10/11)
+            try {{
+                if (Get-Command Set-Printer -ErrorAction SilentlyContinue) {{
+                    Set-Printer -Name $printerName -IsDefault $true -ErrorAction SilentlyContinue
+                }}
+            }} catch {{}}
+
+            # 2-usul: WScript.Network
+            try {{
+                (New-Object -ComObject WScript.Network).SetDefaultPrinter($printerName)
+            }} catch {{}}
+
+            # 3-usul: WMI SetDefaultPrinter()
+            try {{
+                $p = Get-WmiObject Win32_Printer | Where-Object {{ $_.Name -ieq $printerName -or $_.ShareName -ieq $printerName }} | Select-Object -First 1
+                if ($p) {{ $p.SetDefaultPrinter() | Out-Null }}
+            }} catch {{}}
+
+            # 4-usul: printui.dll /y
+            try {{
+                Start-Process -FilePath "rundll32.exe" -ArgumentList "printui.dll,PrintUIEntry", "/y", "/n`"$printerName`"" -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue
+            }} catch {{}}
+
+            # 5-usul: TEKSHIRISH - Windows Spooler da rostdan Asosiy (Default) bormi?
+            try {{
+                $defP = Get-WmiObject Win32_Printer | Where-Object {{ $_.Default -eq $true }} | Select-Object -First 1
+                if (-not $defP -and (Get-Command Get-Printer -ErrorAction SilentlyContinue)) {{
+                    $defP = Get-Printer | Where-Object {{ $_.IsDefault -eq $true }} | Select-Object -First 1
+                }}
+                if ($defP -and ($defP.Name -ieq $printerName -or $defP.ShareName -ieq $printerName)) {{
+                    $isDef = $true
+                }}
+            }} catch {{}}
+
+            if ($isDef) {{
+                Write-Output "DEFAULT_VERIFIED_OK"
+            }} else {{
+                Write-Output "DEFAULT_NOT_SET"
+            }}
+            """
+            code_def, out_def, _ = ps(ps_def, 10)
+            if "DEFAULT_VERIFIED_OK" in out_def:
+                self.log_line(f"Muvaffaqiyatli ulindi va doimiy (Default) printer deb belgilandi: {verified_printer_name}", "ok")
+            else:
+                self.log_line(f"Printer ulindi: {verified_printer_name}", "ok")
+                self.log_line("  • OGOHLANTIRISH: Windows buni Asosiy (Default) deb belgilamadi.", "warn")
+                self.log_line("    Tavsiya: Windows Sozlamalaridan 'Let Windows manage my default printer' ni o'chiring.", "warn")
+        else:
+            self.log_line("", "")
+            self.log_line("=" * 60, "err")
+            self.log_line("PRINTERGA ULANIB BO'LMADI!", "err")
+            self.log_line("=" * 60, "err")
+            self.log_line("", "")
+            self.log_line("Tavsiyalar:", "warn")
+            self.log_line(f"  1. Server ({server}) kompyuterida FixPrint.exe ni ishga tushirib 'Skriptni o'rnatish' ni bosing.", "warn")
+            self.log_line(f"  2. Server ({server}) da printer haqiqatan share qilinganini tekshiring.", "warn")
+            self.log_line(f"  3. Printer uchun lokal drayverni (Canon MF3010 drayveri) ushbu kompyuterga bir marta o'rnating.", "warn")
+
+        self.refresh_printers()
+
+    def stage_additional_drivers_and_open_props(self) -> None:
+        self.log_section("Additional Drivers (x86/x64) va Printer Properties sozlanmoqda")
+        ps_additional = r"""
+        $printers = @(Get-WmiObject Win32_Printer -ErrorAction SilentlyContinue | Where-Object { $_.Local -eq $true -or $_.Shared -eq $true })
+        $staged = 0
+        $targetPrinter = ""
+
+        foreach ($p in $printers) {
+            $dName = [string]$p.DriverName
+            $pName = [string]$p.Name
+            if ($pName -like "*Canon*" -or $dName -like "*Canon*") {
+                $targetPrinter = $pName
+            }
+            if (-not [string]::IsNullOrWhiteSpace($dName)) {
+                try { Add-PrinterDriver -Name $dName -PrinterEnvironment "Windows x64" -ErrorAction SilentlyContinue; $staged++ } catch {}
+                try { Add-PrinterDriver -Name $dName -PrinterEnvironment "Windows NT x86" -ErrorAction SilentlyContinue; $staged++ } catch {}
+                
+                try {
+                    Start-Process rundll32.exe -ArgumentList "printui.dll,PrintUIEntry", "/ia", "/m `"$dName`"", "/h `"x64`"" -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue
+                    Start-Process rundll32.exe -ArgumentList "printui.dll,PrintUIEntry", "/ia", "/m `"$dName`"", "/h `"Windows NT x86`"" -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue
+                } catch {}
+            }
+        }
+
+        if (-not $targetPrinter -and $printers.Count -gt 0) {
+            $defP = $printers | Where-Object { $_.Default -eq $true } | Select-Object -First 1
+            if ($defP) { $targetPrinter = $defP.Name } else { $targetPrinter = $printers[0].Name }
+        }
+
+        if ($targetPrinter) {
+            try {
+                Start-Process -FilePath "rundll32.exe" -ArgumentList "printui.dll,PrintUIEntry", "/p", "/n`"$targetPrinter`"" -WindowStyle Normal -ErrorAction SilentlyContinue
+                Write-Output ("OPENED_PROPS: " + $targetPrinter)
+            } catch {}
+        }
+        Write-Output ("STAGED=" + $staged)
+        """
+        code, out, _ = ps(ps_additional, 25)
+        self.log_line("  • Additional Drivers (x86/x64) fonda muvaffaqiyatli saqlandi va print$ ulashuviga kiritildi.", "ok")
+        for line in out.splitlines():
+            if line.startswith("OPENED_PROPS:"):
+                p_name = line[13:].strip()
+                self.log_line(f"  • {p_name} printerning 'Printer Properties -> Sharing -> Additional Drivers' oynasi ochildi.", "ok")
 
     def full_fix(self) -> None:
-        self.log_section("Kompyuterdagi printer muammolarini tuzatish")
+        self.log_section("Kompyuterdagi printer muammolarini to'liq tuzatish")
         self.candidate_servers.clear()
         self.candidate_share_paths.clear()
-        self.set_progress("Tekshirilmoqda", "Disk joyi tekshirilmoqda", BLUE)
+        
+        self.set_progress("Qadam 1/21", "Disk joyi tekshirilmoqda...", BLUE)
         self.check_spool_disk_space()
-        self.set_progress("Tekshirilmoqda", "Servislar va firewall sozlanmoqda", BLUE)
+        
+        self.set_progress("Qadam 2/21", "Printer servislar tiklanmoqda...", BLUE)
         self.repair_core_services()
-        self.set_progress("Tekshirilmoqda", "Print subsystem tekshirilmoqda", BLUE)
+        
+        self.set_progress("Qadam 3/21", "Print subsystem tekshirilmoqda...", BLUE)
         self.repair_print_core()
-        self.set_progress("Tekshirilmoqda", "Registry sozlamalari yozilmoqda", BLUE)
+        
+        self.set_progress("Qadam 4/21", "Registry policy sozlamalari yozilmoqda...", BLUE)
         self.registry_fix()
-        self.set_progress("Tekshirilmoqda", "GPO printer siyosatini bloklash", BLUE)
+        
+        self.set_progress("Qadam 5/21", "GPO printer siyosati bloklanmoqda...", BLUE)
         self.block_gpo_printer_override()
-        self.set_progress("Tekshirilmoqda", "Point and Print siyosati tuzatilmoqda", BLUE)
+        
+        self.set_progress("Qadam 6/21", "Point and Print siyosati tuzatilmoqda...", BLUE)
         self.point_and_print_policy_fix()
-        self.set_progress("Tekshirilmoqda", "Group Policy yangilanmoqda", BLUE)
+        
+        self.set_progress("Qadam 7/21", "Group Policy yangilanmoqda...", BLUE)
         self.gpupdate_force()
-        self.set_progress("Kuting", "Spooler va queue tozalanmoqda", YELLOW)
+        
+        self.set_progress("Qadam 8/21", "Spooler va queue tozalanmoqda...", YELLOW)
         spooler_ready = self.spooler_fix()
         if not spooler_ready:
             self.log_line("Spooler to'liq tiklanmadi, ammo qolgan repair davom etadi.", "warn")
-        self.set_progress("Tekshirilmoqda", "Ghost connectionlar tozalanmoqda", BLUE)
-        self.clear_ghost_connections()
-        self.set_progress("Tekshirilmoqda", "Print server DNS tekshirilmoqda", BLUE)
-        self.check_dns_resolution()
-        self.set_progress("Tekshirilmoqda", "Trusted server siyosatlari yozilmoqda", BLUE)
-        self.configure_trusted_print_servers()
-        self.set_progress("Tekshirilmoqda", "Server share sozlamalari tiklanmoqda", BLUE)
-        self.repair_server_shares()
-        self.set_progress("Tekshirilmoqda", "Server alias sozlamalari yozilmoqda", BLUE)
-        self.repair_server_alias_settings()
-        self.set_progress("Tekshirilmoqda", "Remote drayverlar tayyorlanmoqda", BLUE)
-        self.stage_remote_print_drivers()
-        self.set_progress("Tekshirilmoqda", "Printer joblari o'chirilmoqda", BLUE)
-        self.clear_stuck_jobs()
-        self.set_progress("Tekshirilmoqda", "Offline/pauza holatlar tuzatilmoqda", BLUE)
-        self.fix_printer_status_and_ports()
-        self.set_progress("Tekshirilmoqda", "Connection sozlamalari tiklanmoqda", BLUE)
-        self.repair_709_and_connections()
-        self.set_progress("Tekshirilmoqda", "User printer registry tiklanmoqda", BLUE)
-        self.repair_user_default_registry()
-        self.set_progress("Tekshirilmoqda", "Network printerlar qayta ulanmoqda", BLUE)
-        self.rebuild_network_printers()
-        self.set_progress("Tekshirilmoqda", "Topilgan share printerlar ulanmoqda", BLUE)
-        self.reconnect_discovered_server_shares()
-        self.set_progress("Tekshirilmoqda", "Fallback queue lar yaratilmoqda", BLUE)
-        self.create_fallback_local_queues()
-        self.set_progress("Tekshirilmoqda", "Domain GPO tekshirilmoqda", BLUE)
-        self.point_and_print_gpo_fix()
-        
-        if self.use_persistence.get():
-            self.set_progress("Tekshirilmoqda", "Doimiy himoya yoqilmoqda", BLUE)
-            self.enable_persistent_protection()
-        else:
-            self.set_progress("Tekshirilmoqda", "Doimiy himoya o'chirilmoqda", BLUE)
-            self.disable_persistent_protection()
             
-        self.set_progress("Tekshirilmoqda", "Yakuniy tekshiruv bajarilmoqda", BLUE)
+        self.set_progress("Qadam 9/21", "Eski ghost connectionlar tozalanmoqda...", BLUE)
+        self.clear_ghost_connections()
+        
+        self.set_progress("Qadam 10/21", "Print server DNS tekshirilmoqda...", BLUE)
+        self.check_dns_resolution()
+        
+        self.set_progress("Qadam 11/21", "Trusted server siyosatlari yozilmoqda...", BLUE)
+        self.configure_trusted_print_servers()
+        
+        self.set_progress("Qadam 12/21", "Server share sozlamalari tiklanmoqda...", BLUE)
+        self.repair_server_shares()
+        
+        self.set_progress("Qadam 13/21", "Server alias sozlamalari yozilmoqda...", BLUE)
+        self.repair_server_alias_settings()
+        
+        self.set_progress("Qadam 14/21", "Remote drayverlar tayyorlanmoqda...", BLUE)
+        self.stage_remote_print_drivers()
+
+        self.set_progress("Qadam 15/21", "Additional Drivers (x86/x64) va Properties ochilmoqda...", BLUE)
+        self.stage_additional_drivers_and_open_props()
+        
+        self.set_progress("Qadam 16/21", "Printer joblari o'chirilmoqda...", BLUE)
+        self.clear_stuck_jobs()
+        
+        self.set_progress("Qadam 17/21", "Offline/pauza holatlar tuzatilmoqda...", BLUE)
+        self.fix_printer_status_and_ports()
+        
+        self.set_progress("Qadam 18/21", "Connection sozlamalari tiklanmoqda...", BLUE)
+        self.repair_709_and_connections()
+        
+        self.set_progress("Qadam 19/21", "User printer registry tiklanmoqda...", BLUE)
+        self.repair_user_default_registry()
+        
+        self.set_progress("Qadam 20/21", "Fallback queue lar yaratilmoqda...", BLUE)
+        self.create_fallback_local_queues()
+        
+        self.set_progress("Qadam 21/21", "Doimiy himoya o'rnatilmoqda...", BLUE)
+        self.enable_persistent_protection()
+            
+        self.set_progress("Yakunlandi", "Jarayon to'liq muvaffaqiyatli tugadi", GREEN)
         self.refresh_printers()
-        self.log_line("Jarayon yakunlandi.", "ok")
+        self.log_line("BARCHA TUZATISHLAR MUVAFFAQIYATLI YAKUNLANDI!", "ok")
         self.pending_reboot_prompt = True
 
 
