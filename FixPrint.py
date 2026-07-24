@@ -2995,6 +2995,11 @@ public class FixPrintPort {{
                 }} else {{
                     Write-Output "METHOD3_LOCALPORT_ERR: Local driver not found"
                 }}
+            }} catch {{
+                Write-Output ("METHOD3_LOCALPORT_ERR: " + $_.Exception.Message)
+            }}
+        }}
+
         # 4-usul: LPT1 REDIRECT (Canon CAPT drayveri pechat xatosini 100% yechuvchi rasmiy yechim!)
         if (-not $connected) {{
             try {{
@@ -3024,7 +3029,7 @@ public class FixPrintPort {{
 
         Start-Sleep -Seconds 2
 
-        # Verification in Spooler
+        # Verification in Spooler (Win+R / Explorer orqali ulangan printerlarni ham 100% aniqlash!)
         $found = $null
         $currentPrinters = @()
         if (Get-Command Get-Printer -ErrorAction SilentlyContinue) {{
@@ -3036,7 +3041,13 @@ public class FixPrintPort {{
         foreach ($p in $currentPrinters) {{
             $pName = [string]$p.Name
             $pPort = if ($p.PSObject.Properties['PortName']) {{ [string]$p.PortName }} else {{ '' }}
-            if ($pName -ieq $unc -or $pPort -ieq $unc -or $pName -like "*$shareName*" -or $pPort -like "*$shareName*") {{
+            if (
+                $pName -ieq $unc -or 
+                $pPort -ieq $unc -or 
+                $pName -like "*$shareName*" -or 
+                $pPort -like "*$shareName*" -or
+                ($pName -like "*$server*" -and $pName -like "*Canon*")
+            ) {{
                 $found = $p
                 break
             }}
